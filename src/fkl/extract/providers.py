@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import TypeVar
 
 import httpx
@@ -109,7 +110,12 @@ class KeyRotator:
     non-exhausted key — no backoff wait, since a daily cap won't clear by
     waiting. Per-minute 429s and 5xx errors are NOT rotation triggers; they
     stay on the current key and get call_gemini's exponential backoff, and
-    propagate to the caller unchanged if that backoff is exhausted."""
+    propagate to the caller unchanged if that backoff is exhausted.
+
+    Safe to share across threads (e.g. a parallel explanation-writing pool):
+    _lock guards state (_current/_exhausted/_clients) but is released
+    before the actual network call, so concurrent generate() calls don't
+    serialize on each other — only the brief key-selection step does."""
 
     def __init__(self, api_keys: list[str]):
         if not api_keys:
@@ -118,6 +124,7 @@ class KeyRotator:
         self._clients: dict[int, genai.Client] = {}
         self._exhausted: set[int] = set()
         self._current = 0
+        self._lock = threading.RLock()
 
     @classmethod
     def from_env(cls) -> KeyRotator:
@@ -138,14 +145,17 @@ class KeyRotator:
         return len(self._api_keys)
 
     def current_index(self) -> int:
-        return self._current
+        with self._lock:
+            return self._current
 
     def _client_for(self, index: int) -> genai.Client:
+        # caller already holds _lock
         if index not in self._clients:
             self._clients[index] = genai.Client(api_key=self._api_keys[index])
         return self._clients[index]
 
     def _advance(self) -> None:
+        # caller already holds _lock
         total = len(self._api_keys)
         for offset in range(1, total + 1):
             candidate = (self._current + offset) % total
@@ -155,26 +165,33 @@ class KeyRotator:
 
     def generate(self, prompt: str, response_model: type[_ResponseT]) -> _ResponseT:
         total = len(self._api_keys)
-        while len(self._exhausted) < total:
-            if self._current in self._exhausted:
-                self._advance()
-                continue
-            client = self._client_for(self._current)
+        while True:
+            with self._lock:
+                if len(self._exhausted) >= total:
+                    raise AllKeysExhaustedError(f"all {total} API key(s) exhausted their daily quota")
+                if self._current in self._exhausted:
+                    self._advance()
+                    continue
+                current_index = self._current
+                client = self._client_for(current_index)
+            # Lock released here — the network call itself runs unlocked,
+            # so other threads can pick their own key and proceed
+            # concurrently instead of queuing behind this one call.
             try:
                 return call_gemini(client, prompt, response_model)
             except errors.APIError as exc:
                 if exc.code == 429 and is_daily_quota_error(exc):
-                    self._exhausted.add(self._current)
-                    logger.warning(
-                        "API key index %d exhausted its daily quota (%d/%d keys exhausted so far)",
-                        self._current,
-                        len(self._exhausted),
-                        total,
-                    )
-                    self._advance()
+                    with self._lock:
+                        self._exhausted.add(current_index)
+                        logger.warning(
+                            "API key index %d exhausted its daily quota (%d/%d keys exhausted so far)",
+                            current_index,
+                            len(self._exhausted),
+                            total,
+                        )
+                        self._advance()
                     continue
                 raise
-        raise AllKeysExhaustedError(f"all {total} API key(s) exhausted their daily quota")
 
 
 def _is_retryable_groq(exc: BaseException) -> bool:

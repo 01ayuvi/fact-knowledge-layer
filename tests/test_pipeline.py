@@ -183,3 +183,52 @@ def test_only_new_candidate_pairs_get_reconciled(repo):
         # -- no new reconciliation, no new LLM calls.
         ingest_document("b.pdf", doc_context={"doc_id": "doc2"}, repo=repo)
         assert mock_generate.call_count == first_call_count
+
+
+def test_explanation_writing_runs_concurrently_bounded_at_four(repo):
+    """Real proof of parallelism, not just that results come back right:
+    5 mutually-matching facts -> 10 independent pairs. A slow (0.3s)
+    mocked call, run fully sequentially, would take ~3s; run with real
+    concurrency capped at 4, it should take roughly ceil(10/4)*0.3 =~ 0.9s.
+    Also tracks the actual concurrent-call high-water mark directly, to
+    confirm it never exceeds MAX_EXPLANATION_WORKERS."""
+    import threading
+    import time
+
+    facts = [
+        make_fact("Delhivery Limited", "Revenue from Operations", str(100 + i), {"period_label": f"FY2{i}"})
+        for i in range(5)
+    ]
+    extraction = ExtractionResult(facts=facts)
+
+    call_delay = 0.3
+    in_flight = {"count": 0, "max": 0}
+    lock = threading.Lock()
+
+    def slow_generate(*args, **kwargs):
+        with lock:
+            in_flight["count"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["count"])
+        time.sleep(call_delay)
+        with lock:
+            in_flight["count"] -= 1
+        return (ExplanationResponse(explanation="x"), "test-model")
+
+    with (
+        patch("src.fkl.pipeline.extract_blocks", return_value=[]),
+        patch("src.fkl.pipeline.extract_facts", return_value=extraction),
+        patch("src.fkl.reconcile.adjudicator.generate", side_effect=slow_generate),
+    ):
+        t0 = time.time()
+        result = ingest_document("x.pdf", doc_context={"doc_id": "doc1"}, repo=repo)
+        elapsed = time.time() - t0
+
+    n_pairs = 5 * 4 // 2  # C(5,2)
+    assert sum(result.relations_by_type.values()) == n_pairs
+    assert len(repo.relations_by_doc("doc1")) == n_pairs
+    assert in_flight["max"] <= 4, f"exceeded max concurrency: {in_flight['max']}"
+    assert in_flight["max"] > 1, "no real concurrency observed — looks sequential"
+    sequential_estimate = n_pairs * call_delay
+    assert elapsed < sequential_estimate * 0.6, (
+        f"elapsed {elapsed:.2f}s not meaningfully faster than sequential {sequential_estimate:.2f}s"
+    )

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,7 @@ from src.fkl.extract.providers import KeyRotator, generate
 from src.fkl.ingest.pdf import extract_blocks
 from src.fkl.reconcile import adjudicator
 from src.fkl.reconcile.rules import reconcile
-from src.fkl.store.models import RelationType
+from src.fkl.store.models import Fact, Relation, RelationType
 from src.fkl.store.repo import Repo
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,14 @@ _SCALE_HINT_RE = re.compile(
 )
 MAX_SCALE_HINT_SNIPPETS = 3
 SCALE_HINT_CONTEXT_CHARS = 60
+
+# Explanation-writing/adjudication is one LLM call per candidate pair and
+# they're independent of each other, so they parallelize cleanly — see
+# _reconcile_pair. 4 concurrent workers bounds how hard we hit the
+# provider; KeyRotator is thread-safe (see providers.py) and every worker
+# still gets the SAME retry/backoff/rotation behavior per call, so this
+# caps concurrency without bypassing rate-limit handling.
+MAX_EXPLANATION_WORKERS = 4
 
 
 class DocContextResponse(BaseModel):
@@ -167,6 +176,18 @@ class IngestResult:
     relations_by_type: dict[str, int] = field(default_factory=dict)
 
 
+def _reconcile_pair(fact: Fact, other_fact: Fact, rotator: KeyRotator) -> Relation:
+    """Runs in a worker thread — reconcile() is pure/deterministic, and
+    write_explanation()/adjudicate() only touch the shared KeyRotator
+    (thread-safe, see providers.py) and the network. No repo access here:
+    sqlite3 connections aren't thread-safe, so persistence happens back on
+    the main thread once this returns (see ingest_document)."""
+    relation = reconcile(fact, other_fact)
+    if adjudicator.is_adjudication_candidate(fact, other_fact, relation):
+        return adjudicator.adjudicate(fact, other_fact, relation, rotator=rotator)
+    return adjudicator.write_explanation(relation, fact, other_fact, rotator=rotator)
+
+
 def ingest_document(
     pdf_path: str,
     doc_context: dict[str, Any] | None = None,
@@ -216,18 +237,32 @@ def ingest_document(
         for entry in extraction.quarantined:
             repo.add_quarantine(doc_id, entry.fact, entry.reason, entry.score)
 
-        relations_by_type: dict[str, int] = {t.value: 0 for t in RelationType}
+        # Candidate lookup is repo reads only — stays on the main thread
+        # (sqlite3 connections aren't thread-safe). Dedupe pairs found from
+        # both directions (fact A's search finds B, and later B's search
+        # finds A, since by then A is already persisted) before any work
+        # is submitted, not just before persisting — otherwise the same
+        # pair gets explained twice by two different workers.
+        pending_pairs: list[tuple[Fact, Fact]] = []
+        seen_pairs: set[frozenset[str]] = set()
         for fact in extraction.facts:
             for other_fact, _match_level in repo.candidates_for_fact(fact):
                 if repo.relation_exists(fact.id, other_fact.id):
                     continue  # already reconciled in a previous ingest — skip, don't re-spend an LLM call
-                relation = reconcile(fact, other_fact)
-                if adjudicator.is_adjudication_candidate(fact, other_fact, relation):
-                    relation = adjudicator.adjudicate(fact, other_fact, relation, rotator=rotator)
-                else:
-                    relation = adjudicator.write_explanation(relation, fact, other_fact, rotator=rotator)
-                repo.add_relation(relation)
-                relations_by_type[relation.type.value] += 1
+                pair_ids = frozenset((fact.id, other_fact.id))
+                if pair_ids in seen_pairs:
+                    continue
+                seen_pairs.add(pair_ids)
+                pending_pairs.append((fact, other_fact))
+
+        relations_by_type: dict[str, int] = {t.value: 0 for t in RelationType}
+        if pending_pairs:
+            with ThreadPoolExecutor(max_workers=MAX_EXPLANATION_WORKERS) as pool:
+                futures = [pool.submit(_reconcile_pair, a, b, rotator) for a, b in pending_pairs]
+                for future in as_completed(futures):
+                    relation = future.result()
+                    repo.add_relation(relation)  # persistence stays on the main thread
+                    relations_by_type[relation.type.value] += 1
 
         return IngestResult(
             doc_id=doc_id,
