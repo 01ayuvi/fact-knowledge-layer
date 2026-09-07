@@ -200,6 +200,16 @@ def _row_to_relation(row: sqlite3.Row) -> Relation:
     )
 
 
+def _row_to_quarantine(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "doc_id": row["doc_id"],
+        "fact": Fact.model_validate_json(row["fact"]),
+        "reason": row["reason"],
+        "score": row["score"],
+    }
+
+
 class Repo:
     def __init__(self, db_path: str | Path = "data/store.db"):
         path = Path(db_path)
@@ -237,6 +247,29 @@ class Repo:
         row = self.conn.execute("SELECT doc_context FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
         return json.loads(row["doc_context"]) if row else None
 
+    def get_document(self, doc_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM documents WHERE doc_id = ?", (doc_id,)).fetchone()
+        if row is None:
+            return None
+        return {
+            "doc_id": row["doc_id"],
+            "pdf_path": row["pdf_path"],
+            "doc_context": json.loads(row["doc_context"]),
+            "ingested_at": row["ingested_at"],
+        }
+
+    def list_documents(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM documents ORDER BY ingested_at DESC").fetchall()
+        return [
+            {
+                "doc_id": r["doc_id"],
+                "pdf_path": r["pdf_path"],
+                "doc_context": json.loads(r["doc_context"]),
+                "ingested_at": r["ingested_at"],
+            }
+            for r in rows
+        ]
+
     # -- facts --
 
     def add_fact(self, fact: Fact) -> None:
@@ -256,6 +289,37 @@ class Repo:
 
     def facts_by_doc(self, doc_id: str) -> list[Fact]:
         rows = self.conn.execute("SELECT * FROM facts WHERE doc_id = ?", (doc_id,)).fetchall()
+        return [_row_to_fact(r) for r in rows]
+
+    def query_facts(
+        self,
+        doc_id: str | None = None,
+        subject: str | None = None,
+        measure: str | None = None,
+        limit: int = 500,
+    ) -> list[Fact]:
+        """subject/measure match against canonical_id OR surface_form,
+        case-insensitively, substring — filters are for a UI, not an exact
+        key lookup (that's facts_sharing_claim_key/loose_key)."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if doc_id:
+            clauses.append("doc_id = ?")
+            params.append(doc_id)
+        if subject:
+            clauses.append(
+                "(LOWER(subject_canonical_id) LIKE ? OR LOWER(subject_surface_form) LIKE ?)"
+            )
+            needle = f"%{subject.lower()}%"
+            params.extend([needle, needle])
+        if measure:
+            clauses.append(
+                "(LOWER(measure_canonical_id) LIKE ? OR LOWER(measure_surface_form) LIKE ?)"
+            )
+            needle = f"%{measure.lower()}%"
+            params.extend([needle, needle])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(f"SELECT * FROM facts {where} LIMIT ?", (*params, limit)).fetchall()
         return [_row_to_fact(r) for r in rows]
 
     def facts_sharing_claim_key(self, claim_key: str, exclude_fact_id: str | None = None) -> list[Fact]:
@@ -295,9 +359,11 @@ class Repo:
 
     def quarantined_by_doc(self, doc_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM quarantined WHERE doc_id = ?", (doc_id,)).fetchall()
-        return [
-            {"fact": Fact.model_validate_json(r["fact"]), "reason": r["reason"], "score": r["score"]} for r in rows
-        ]
+        return [_row_to_quarantine(r) for r in rows]
+
+    def all_quarantined(self, limit: int = 500) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM quarantined ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+        return [_row_to_quarantine(r) for r in rows]
 
     # -- relations --
 
@@ -324,4 +390,23 @@ class Repo:
             f"SELECT * FROM relations WHERE fact_a_id IN ({placeholders}) OR fact_b_id IN ({placeholders})",
             (*fact_ids, *fact_ids),
         ).fetchall()
+        return [_row_to_relation(r) for r in rows]
+
+    def get_relation(self, relation_id: str) -> Relation | None:
+        row = self.conn.execute("SELECT * FROM relations WHERE id = ?", (relation_id,)).fetchone()
+        return _row_to_relation(row) if row else None
+
+    def query_relations(
+        self, type: str | None = None, reason_code: str | None = None, limit: int = 500
+    ) -> list[Relation]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if type:
+            clauses.append("type = ?")
+            params.append(type)
+        if reason_code:
+            clauses.append("reason_code = ?")
+            params.append(reason_code)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(f"SELECT * FROM relations {where} LIMIT ?", (*params, limit)).fetchall()
         return [_row_to_relation(r) for r in rows]

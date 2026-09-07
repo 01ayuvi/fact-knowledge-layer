@@ -170,3 +170,66 @@ def test_facts_from_different_docs_still_share_claim_key(repo):
     assert len(candidates) == 1
     assert candidates[0][0].id == fact_doc1.id
     assert candidates[0][1] == "exact"
+
+
+def test_list_documents_and_get_document(repo):
+    repo.add_document("doc2", "b.pdf", {"doc_id": "doc2", "publisher": "Falcon Autotech"})
+    docs = repo.list_documents()
+    doc_ids = {d["doc_id"] for d in docs}
+    assert {"doc1", "doc2"} <= doc_ids
+    got = repo.get_document("doc2")
+    assert got["pdf_path"] == "b.pdf"
+    assert got["doc_context"]["publisher"] == "Falcon Autotech"
+    assert repo.get_document("nonexistent") is None
+
+
+def test_query_facts_filters_by_doc_subject_measure(repo):
+    repo.add_document("doc2", "b.pdf", {"doc_id": "doc2"})
+    delhivery_revenue = make_fact("Delhivery Limited", "Revenue from Operations", "100")
+    delhivery_pat = make_fact("Delhivery Limited", "PAT", "50")
+    falcon_fact = make_fact("Falcon Autotech", "ownership stake", "39%", doc_id="doc2")
+    repo.add_fact(delhivery_revenue)
+    repo.add_fact(delhivery_pat)
+    repo.add_fact(falcon_fact)
+
+    assert {f.id for f in repo.query_facts(doc_id="doc1")} == {delhivery_revenue.id, delhivery_pat.id}
+    assert {f.id for f in repo.query_facts(subject="falcon")} == {falcon_fact.id}
+    assert {f.id for f in repo.query_facts(measure="revenue")} == {delhivery_revenue.id}
+    assert {f.id for f in repo.query_facts(subject="DELHIVERY")} == {delhivery_revenue.id, delhivery_pat.id}
+    assert repo.query_facts(subject="nonexistent") == []
+
+
+def test_get_relation_and_query_relations(repo):
+    fact_a = make_fact("Delhivery Limited", "Revenue from Operations", "100")
+    fact_b = make_fact("Delhivery Limited", "Revenue from Operations", "150")
+    repo.add_fact(fact_a)
+    repo.add_fact(fact_b)
+    relation = Relation(
+        id=str(uuid.uuid4()), fact_a_id=fact_a.id, fact_b_id=fact_b.id,
+        type=RelationType.CONTRADICTS, reason_code=ReasonCode.VALUES_DIVERGE,
+        explanation="x", confidence=0.9, adjudicator="rule",
+    )
+    repo.add_relation(relation)
+
+    got = repo.get_relation(relation.id)
+    assert got is not None and got.explanation == "x"
+    assert repo.get_relation("nonexistent") is None
+
+    assert len(repo.query_relations(type="CONTRADICTS")) == 1
+    assert len(repo.query_relations(type="CORROBORATES")) == 0
+    assert len(repo.query_relations(reason_code="VALUES_DIVERGE")) == 1
+    assert len(repo.query_relations(type="CONTRADICTS", reason_code="VALUES_DIVERGE")) == 1
+    assert len(repo.query_relations(type="CONTRADICTS", reason_code="SCOPE_MISMATCH")) == 0
+
+
+def test_all_quarantined_across_documents(repo):
+    repo.add_document("doc2", "b.pdf", {"doc_id": "doc2"})
+    fact1 = make_fact("Delhivery Limited", "revenue", "garbled")
+    fact2 = make_fact("Falcon Autotech", "stake", "garbled2", doc_id="doc2")
+    repo.add_quarantine("doc1", fact1, "reason1", 40.0)
+    repo.add_quarantine("doc2", fact2, "reason2", 50.0)
+
+    all_entries = repo.all_quarantined()
+    assert len(all_entries) == 2
+    assert {e["doc_id"] for e in all_entries} == {"doc1", "doc2"}
+    assert {e["fact"].id for e in all_entries} == {fact1.id, fact2.id}

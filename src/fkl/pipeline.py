@@ -27,7 +27,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pymupdf
 from pydantic import BaseModel
@@ -193,7 +193,13 @@ def ingest_document(
     doc_context: dict[str, Any] | None = None,
     repo: Repo | None = None,
     rotator: KeyRotator | None = None,
+    on_progress: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> IngestResult:
+    """on_progress(stage, data), called synchronously at each checkpoint
+    below — a no-op by default. This is the hook apps/api's SSE endpoint
+    wires up to stream progress; ingest_document itself has no notion of
+    HTTP or SSE, it just reports where it is."""
+    notify = on_progress or (lambda stage, data: None)
     owns_repo = repo is None
     if repo is None:
         repo = Repo()
@@ -202,6 +208,7 @@ def ingest_document(
 
     try:
         doc_id = (doc_context or {}).get("doc_id") or _doc_id_for(pdf_path)
+        notify("started", {"pdf_path": pdf_path, "doc_id": doc_id})
 
         if repo.has_document(doc_id):
             # Already ingested: skip extraction and doc-context derivation
@@ -212,30 +219,46 @@ def ingest_document(
             relations_by_type = {t.value: 0 for t in RelationType}
             for relation in repo.relations_by_doc(doc_id):
                 relations_by_type[relation.type.value] += 1
-            return IngestResult(
+            result = IngestResult(
                 doc_id=doc_id,
                 facts=len(repo.facts_by_doc(doc_id)),
                 quarantined=len(repo.quarantined_by_doc(doc_id)),
                 relations_by_type=relations_by_type,
             )
+            notify("already_ingested", {"doc_id": doc_id, "result": result})
+            notify("done", {"result": result})
+            return result
 
         blocks = extract_blocks(pdf_path)
+        notify("blocks_extracted", {"count": len(blocks)})
 
         if doc_context is None:
+            notify("deriving_doc_context", {})
             doc_context = derive_doc_context(pdf_path, rotator=rotator)
         doc_context["doc_id"] = doc_id
+        notify("doc_context", {"doc_context": doc_context})
 
         repo.add_document(doc_id, pdf_path, doc_context)
 
         # extract_facts() already applies the grounding gate internally
         # (see extract/extractor.py, extract/grounding_gate.py) — a fact
         # never reaches result.facts unverified.
+        notify("extracting", {})
         extraction = extract_facts(blocks, doc_context, pdf_path, rotator=rotator)
+        notify(
+            "extraction_complete",
+            {
+                "facts": len(extraction.facts),
+                "quarantined": len(extraction.quarantined),
+                "failed_batches": len(extraction.failed_batches),
+            },
+        )
 
         for fact in extraction.facts:
             repo.add_fact(fact)
         for entry in extraction.quarantined:
             repo.add_quarantine(doc_id, entry.fact, entry.reason, entry.score)
+        notify("facts_persisted", {"count": len(extraction.facts), "quarantined": len(extraction.quarantined)})
 
         # Candidate lookup is repo reads only — stays on the main thread
         # (sqlite3 connections aren't thread-safe). Dedupe pairs found from
@@ -254,22 +277,40 @@ def ingest_document(
                     continue
                 seen_pairs.add(pair_ids)
                 pending_pairs.append((fact, other_fact))
+        notify("candidates_found", {"count": len(pending_pairs)})
 
         relations_by_type: dict[str, int] = {t.value: 0 for t in RelationType}
         if pending_pairs:
+            total_pairs = len(pending_pairs)
+            done_pairs = 0
             with ThreadPoolExecutor(max_workers=MAX_EXPLANATION_WORKERS) as pool:
                 futures = [pool.submit(_reconcile_pair, a, b, rotator) for a, b in pending_pairs]
                 for future in as_completed(futures):
                     relation = future.result()
                     repo.add_relation(relation)  # persistence stays on the main thread
                     relations_by_type[relation.type.value] += 1
+                    done_pairs += 1
+                    notify(
+                        "relation",
+                        {
+                            "done": done_pairs,
+                            "total": total_pairs,
+                            "type": relation.type.value,
+                            "reason_code": relation.reason_code.value,
+                        },
+                    )
 
-        return IngestResult(
+        result = IngestResult(
             doc_id=doc_id,
             facts=len(extraction.facts),
             quarantined=len(extraction.quarantined),
             relations_by_type=relations_by_type,
         )
+        notify("done", {"result": result})
+        return result
+    except Exception as exc:
+        notify("error", {"message": str(exc)})
+        raise
     finally:
         if owns_repo:
             repo.close()

@@ -232,3 +232,57 @@ def test_explanation_writing_runs_concurrently_bounded_at_four(repo):
     assert elapsed < sequential_estimate * 0.6, (
         f"elapsed {elapsed:.2f}s not meaningfully faster than sequential {sequential_estimate:.2f}s"
     )
+
+
+def test_on_progress_reports_expected_stages(repo):
+    fact_a = make_fact("Delhivery Limited", "Revenue from Operations", "100", {"period_label": "FY24"})
+    fact_b = make_fact("Delhivery Limited", "Revenue from Operations", "101", {"period_label": "FY24"}, doc_id="doc2")
+
+    events: list[tuple[str, dict]] = []
+
+    with (
+        patch("src.fkl.pipeline.extract_blocks", return_value=[]),
+        patch("src.fkl.pipeline.extract_facts", return_value=ExtractionResult(facts=[fact_a])),
+    ):
+        ingest_document("a.pdf", doc_context={"doc_id": "doc1"}, repo=repo, on_progress=lambda s, d: events.append((s, d)))
+
+    stages = [s for s, _ in events]
+    assert stages[0] == "started"
+    assert "blocks_extracted" in stages
+    assert "doc_context" in stages
+    assert "extraction_complete" in stages
+    assert "facts_persisted" in stages
+    assert "candidates_found" in stages
+    assert stages[-1] == "done"
+    assert "deriving_doc_context" not in stages  # doc_context was supplied, not derived
+
+    done_event = next(d for s, d in events if s == "done")
+    assert done_event["result"].facts == 1
+
+    # Second document: candidate found against doc1's fact -> a "relation" event fires.
+    events.clear()
+    with (
+        patch("src.fkl.pipeline.extract_blocks", return_value=[]),
+        patch("src.fkl.pipeline.extract_facts", return_value=ExtractionResult(facts=[fact_b])),
+        patch("src.fkl.reconcile.adjudicator.generate", return_value=(ExplanationResponse(explanation="x"), "test-model")),
+    ):
+        ingest_document("b.pdf", doc_context={"doc_id": "doc2"}, repo=repo, on_progress=lambda s, d: events.append((s, d)))
+    relation_events = [d for s, d in events if s == "relation"]
+    assert len(relation_events) == 1
+    # fact_a="100", fact_b="101": same exact claim key (subject/measure/period
+    # all match, no other qualifiers), ~0.99% apart -- beyond the 0.1%
+    # rounding tolerance, so this is a genuine CONTRADICTS/VALUES_DIVERGE.
+    assert relation_events[0] == {"done": 1, "total": 1, "type": "CONTRADICTS", "reason_code": "VALUES_DIVERGE"}
+
+
+def test_on_progress_reports_already_ingested_short_circuit(repo):
+    fact = make_fact("Delhivery Limited", "Revenue from Operations", "100")
+    with (
+        patch("src.fkl.pipeline.extract_blocks", return_value=[]),
+        patch("src.fkl.pipeline.extract_facts", return_value=ExtractionResult(facts=[fact])),
+    ):
+        ingest_document("a.pdf", doc_context={"doc_id": "doc1"}, repo=repo)
+
+    events: list[str] = []
+    ingest_document("a.pdf", doc_context={"doc_id": "doc1"}, repo=repo, on_progress=lambda s, d: events.append(s))
+    assert events == ["started", "already_ingested", "done"]

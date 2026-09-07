@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fact Knowledge Layer</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>Fact Knowledge Layer</h1>
+  <nav id="tabs">
+    <button class="tab-btn active" data-tab="upload">Upload</button>
+    <button class="tab-btn" data-tab="facts">Facts</button>
+    <button class="tab-btn" data-tab="relations">Relations</button>
+    <button class="tab-btn" data-tab="review">Review Queue</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ===================== Upload ===================== -->
+  <section id="tab-upload" class="tab-panel active">
+    <div class="upload-box">
+      <input type="file" id="pdf-input" accept="application/pdf">
+      <button id="upload-btn">Upload &amp; Ingest</button>
+    </div>
+    <div id="upload-progress" class="progress-log" hidden></div>
+    <div id="upload-summary" hidden></div>
+  </section>
+
+  <!-- ===================== Facts ===================== -->
+  <section id="tab-facts" class="tab-panel">
+    <div class="filters">
+      <select id="facts-doc-filter"><option value="">All documents</option></select>
+      <input type="text" id="facts-subject-filter" placeholder="Filter by subject…">
+      <input type="text" id="facts-measure-filter" placeholder="Filter by measure…">
+      <button id="facts-refresh">Refresh</button>
+    </div>
+    <div class="split-view">
+      <div class="table-wrap">
+        <table id="facts-table">
+          <thead><tr>
+            <th>Subject</th><th>Measure</th><th>Value</th><th>Period</th><th>Page</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="fact-detail" class="detail-panel" hidden>
+        <h3>Evidence</h3>
+        <div class="page-render">
+          <div class="page-render-inner">
+            <img id="fact-page-img" alt="PDF page render">
+            <div id="fact-highlight-overlay"></div>
+          </div>
+        </div>
+        <dl id="fact-detail-fields"></dl>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== Relations ===================== -->
+  <section id="tab-relations" class="tab-panel">
+    <div class="filters">
+      <select id="relations-type-filter">
+        <option value="">All types</option>
+        <option value="CORROBORATES">CORROBORATES</option>
+        <option value="CONTRADICTS">CONTRADICTS</option>
+        <option value="SUPERSEDES">SUPERSEDES</option>
+        <option value="RECONCILED_BY_CONTEXT">RECONCILED_BY_CONTEXT</option>
+        <option value="REFINES">REFINES</option>
+      </select>
+      <input type="text" id="relations-reason-filter" placeholder="Filter by reason code…">
+      <button id="relations-refresh">Refresh</button>
+    </div>
+    <div class="split-view">
+      <div class="table-wrap">
+        <table id="relations-table">
+          <thead><tr>
+            <th>Verdict</th><th>Reason</th><th>Fact A</th><th>Fact B</th><th>Confidence</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="relation-detail" class="detail-panel" hidden>
+        <h3><span id="relation-verdict-badge" class="badge"></span> <span id="relation-reason-code"></span></h3>
+        <p id="relation-explanation"></p>
+        <div class="quote-pair">
+          <div class="quote-box">
+            <h4 id="relation-fact-a-label"></h4>
+            <blockquote id="relation-fact-a-quote"></blockquote>
+            <dl id="relation-fact-a-fields"></dl>
+          </div>
+          <div class="quote-box">
+            <h4 id="relation-fact-b-label"></h4>
+            <blockquote id="relation-fact-b-quote"></blockquote>
+            <dl id="relation-fact-b-fields"></dl>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== Review ===================== -->
+  <section id="tab-review" class="tab-panel">
+    <table id="review-table">
+      <thead><tr>
+        <th>Document</th><th>Subject</th><th>Measure</th><th>Quote</th><th>Reason</th><th>Score</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
