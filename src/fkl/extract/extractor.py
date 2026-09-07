@@ -40,6 +40,7 @@ from google.genai import errors, types
 from pydantic import BaseModel, Field, ValidationError
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
+from src.fkl.extract.grounding_gate import GroundingGate, QuarantineEntry
 from src.fkl.ingest.pdf import Block
 from src.fkl.ingest.tables import ReconstructedTable, TableCell, reconstruct_table
 from src.fkl.store.models import Confidence, Entity, Evidence, Fact, Measure, Provenance, Value
@@ -141,6 +142,7 @@ class BatchFailure:
 class ExtractionResult:
     facts: list[Fact] = field(default_factory=list)
     failed_batches: list[BatchFailure] = field(default_factory=list)
+    quarantined: list[QuarantineEntry] = field(default_factory=list)
 
 
 def _slugify(text: str) -> str:
@@ -491,13 +493,6 @@ def _generate(
         return rotator.generate(prompt, call_fn=gemini_call_fn), MODEL_NAME
 
 
-def _locate_quote(block_text: str, quote: str) -> tuple[int, int] | None:
-    start = block_text.find(quote)
-    if start == -1:
-        return None
-    return start, start + len(quote)
-
-
 def _to_fact(
     extracted: ExtractedFact,
     block: Block,
@@ -505,6 +500,11 @@ def _to_fact(
     doc_id: str,
     model_used: str,
 ) -> Fact | None:
+    """Builds a candidate Fact with provisional evidence offsets (0,
+    len(quote)) — NOT grounding-verified yet. The caller must run this
+    through GroundingGate.verify(), which corrects char_start/char_end on
+    pass or quarantines the fact on fail; nothing here decides groundedness
+    anymore (see grounding_gate.py)."""
     if not extracted.subject_surface_form.strip():
         logger.warning(
             "dropping fact with no subject: %r (page %d block %d)",
@@ -513,16 +513,6 @@ def _to_fact(
             block.block_no,
         )
         return None
-
-    span = _locate_quote(block.text, extracted.evidence_quote)
-    if span is None:
-        logger.warning(
-            "dropping ungrounded fact: quote not found verbatim in page %d block %d",
-            block.page_no,
-            block.block_no,
-        )
-        return None
-    char_start, char_end = span
 
     qualifiers: dict[str, Any] = {kv.key: kv.value for kv in extracted.qualifiers}
     if "period_resolved" in qualifiers:
@@ -553,8 +543,8 @@ def _to_fact(
         qualifiers=qualifiers,
         evidence=Evidence(
             page_no=block.page_no,
-            char_start=char_start,
-            char_end=char_end,
+            char_start=0,
+            char_end=len(extracted.evidence_quote),
             bbox=[block.bbox],
             quote=extracted.evidence_quote,
             section_path=[heading] if heading else [],
@@ -736,10 +726,12 @@ def _to_table_fact(
     semantics: TableFactSemantics,
     record: _TableCellRecord,
     doc_context: dict[str, Any],
-    blocks_by_page_and_no: dict[tuple[int, int], Block],
     doc_id: str,
     model_used: str,
 ) -> Fact | None:
+    """Builds a candidate Fact with provisional evidence offsets — NOT
+    grounding-verified yet, same contract as _to_fact. The caller runs it
+    through GroundingGate.verify() against the source block's text."""
     if not semantics.subject_surface_form.strip():
         logger.warning(
             "dropping table fact with no subject: %r (page %d block %d)",
@@ -748,26 +740,6 @@ def _to_table_fact(
             record.source_block_no,
         )
         return None
-
-    source_block = blocks_by_page_and_no.get((record.page_no, record.source_block_no))
-    if source_block is None:
-        logger.warning(
-            "dropping table fact: no source Block for page %d block %d",
-            record.page_no,
-            record.source_block_no,
-        )
-        return None
-
-    span = _locate_quote(source_block.text, record.value_cell.text)
-    if span is None:
-        logger.warning(
-            "dropping ungrounded table fact: %r not found verbatim in page %d block %d",
-            record.value_cell.text,
-            record.page_no,
-            record.source_block_no,
-        )
-        return None
-    char_start, char_end = span
 
     qualifiers: dict[str, Any] = {kv.key: kv.value for kv in semantics.qualifiers}
     # Deterministic column-header parsing is authoritative over LLM guesses
@@ -805,8 +777,8 @@ def _to_table_fact(
         qualifiers=qualifiers,
         evidence=Evidence(
             page_no=record.page_no,
-            char_start=char_start,
-            char_end=char_end,
+            char_start=0,
+            char_end=len(record.value_cell.text),
             bbox=[record.value_cell.bbox],
             quote=record.value_cell.text,
             section_path=[],
@@ -828,6 +800,7 @@ def _extract_table_facts(
     pdf_path: str,
     rotator: KeyRotator,
     result: ExtractionResult,
+    gate: GroundingGate,
 ) -> None:
     doc_id = doc_context.get("doc_id", "unknown")
     table_page_nos = sorted({b.page_no for b in blocks if b.page_type == "table"})
@@ -884,8 +857,16 @@ def _extract_table_facts(
                     logger.warning("dropping table fact with out-of-range cell_index %d", semantics.cell_index)
                     continue
                 record = batch[semantics.cell_index]
-                fact = _to_table_fact(semantics, record, doc_context, blocks_by_page_and_no, doc_id, model_used)
-                if fact is not None:
+                fact = _to_table_fact(semantics, record, doc_context, doc_id, model_used)
+                if fact is None:
+                    continue
+                source_block = blocks_by_page_and_no.get((record.page_no, record.source_block_no))
+                if source_block is None:
+                    gate.quarantine(
+                        fact, f"no source Block for page {record.page_no} block {record.source_block_no}"
+                    )
+                    continue
+                if gate.verify(fact, source_block.text):
                     result.facts.append(fact)
 
 
@@ -911,8 +892,14 @@ def extract_facts(
     rotated API key (see KeyRotator, AllKeysExhaustedError) — is logged and
     recorded in the result's failed_batches, not raised — one bad batch must
     not abort extraction for the rest of the document.
+
+    Every candidate fact — prose or table — passes through a GroundingGate
+    before it can reach result.facts (see grounding_gate.py): a fact whose
+    evidence_quote doesn't fuzzy-match its source block is quarantined into
+    result.quarantined with a reason, never silently dropped.
     """
     doc_id = doc_context.get("doc_id", "unknown")
+    gate = GroundingGate()
 
     prose_blocks = [b for b in blocks if b.page_type == "prose"]
     table_blocks = [b for b in blocks if b.page_type == "table"]
@@ -974,10 +961,11 @@ def extract_facts(
                 continue
             block, heading = batch[extracted.block_index]
             fact = _to_fact(extracted, block, heading, doc_id, model_used)
-            if fact is not None:
+            if fact is not None and gate.verify(fact, block.text):
                 result.facts.append(fact)
 
     if table_blocks:
-        _extract_table_facts(blocks, doc_context, pdf_path, rotator, result)
+        _extract_table_facts(blocks, doc_context, pdf_path, rotator, result, gate)
 
+    result.quarantined = gate.quarantined
     return result
