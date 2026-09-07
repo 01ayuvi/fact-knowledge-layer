@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,15 +40,35 @@ from src.fkl.store.models import Confidence, Entity, Evidence, Fact, Measure, Pr
 
 logger = logging.getLogger(__name__)
 
-BATCH_CHAR_BUDGET = 6000
+# BATCH_CHAR_BUDGET bounds the CONTENT portion of a batch (block/cell text
+# plus its own per-item template overhead) -- it is NOT the full prompt
+# size. _build_prompt/_build_table_prompt also add ~5000 chars of fixed
+# instructions plus, for Groq, ~2000 chars of appended JSON Schema (see
+# providers._append_json_schema_instructions) on EVERY call, regardless of
+# batch size. A real batch on the RBI annual report (52-130 blocks, each
+# comfortably under the old text-only budget) produced actual prompts of
+# 15,000-23,000 characters and got rejected with 413 Payload Too Large --
+# the per-block "--- BLOCK N (page P, section: S) ---" header line was
+# never counted at all. PER_BLOCK_OVERHEAD_CHARS/PER_TABLE_CELL_OVERHEAD_CHARS
+# below fix the accounting; MAX_BLOCKS_PER_BATCH/MAX_TABLE_CELLS_PER_BATCH
+# are a hard backstop independent of character counting, since many
+# short blocks can still rack up overhead the char budget alone might
+# under-price.
+BATCH_CHAR_BUDGET = 3500
+PER_BLOCK_OVERHEAD_CHARS = 120
+PER_TABLE_CELL_OVERHEAD_CHARS = 30
+MAX_BLOCKS_PER_BATCH = 20
+MAX_TABLE_CELLS_PER_BATCH = 20
 HEADING_MAX_CHARS = 80
 CACHE_DIR = Path("data/cache/extract")
 TABLE_CACHE_DIR = Path("data/cache/extract_tables")
 # Bumped past the Gemini-only versions: the cache key must reflect that a
 # batch was attempted under the Groq-default/Gemini-fallback scheme, so an
 # old Gemini-only cache entry can never be silently served post-switch.
-PROMPT_VERSION = "extract-v4"
-TABLE_PROMPT_VERSION = "extract-table-v3"
+# Bumped again for the corrected batching (smaller, differently-shaped
+# batches invalidate any cache keyed on the old batch boundaries).
+PROMPT_VERSION = "extract-v5"
+TABLE_PROMPT_VERSION = "extract-table-v4"
 
 CONSOLIDATION_RE = re.compile(r"\b(standalone|consolidated)\b", re.IGNORECASE)
 DATE_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
@@ -154,12 +175,14 @@ def _make_batches(
     current: list[tuple[Block, str | None]] = []
     current_chars = 0
     for item in tagged:
-        block_len = len(item[0].text)
-        if current and current_chars + block_len > BATCH_CHAR_BUDGET:
+        item_len = len(item[0].text) + PER_BLOCK_OVERHEAD_CHARS
+        over_budget = current and current_chars + item_len > BATCH_CHAR_BUDGET
+        over_count = current and len(current) >= MAX_BLOCKS_PER_BATCH
+        if over_budget or over_count:
             batches.append(current)
             current, current_chars = [], 0
         current.append(item)
-        current_chars += block_len
+        current_chars += item_len
     if current:
         batches.append(current)
     return batches
@@ -382,8 +405,15 @@ def _make_table_batches(records: list[_TableCellRecord]) -> list[list[_TableCell
     current: list[_TableCellRecord] = []
     current_chars = 0
     for record in records:
-        record_len = len(record.row_label_text) + len(record.header_text) + len(record.value_cell.text)
-        if current and current_chars + record_len > BATCH_CHAR_BUDGET:
+        record_len = (
+            len(record.row_label_text)
+            + len(record.header_text)
+            + len(record.value_cell.text)
+            + PER_TABLE_CELL_OVERHEAD_CHARS
+        )
+        over_budget = current and current_chars + record_len > BATCH_CHAR_BUDGET
+        over_count = current and len(current) >= MAX_TABLE_CELLS_PER_BATCH
+        if over_budget or over_count:
             batches.append(current)
             current, current_chars = [], 0
         current.append(record)
@@ -566,7 +596,12 @@ def _extract_table_facts(
         records = _table_cell_records(table)
         batches = _make_table_batches(records)
 
-        for batch_index, batch in enumerate(batches):
+        # Same 413-splitting queue as extract_facts()'s prose loop — see
+        # that loop's comment for why this isn't a plain enumerate().
+        queue: deque[list[_TableCellRecord]] = deque(batches)
+        batch_index = 0
+        while queue:
+            batch = queue.popleft()
             cache_key = _table_batch_cache_key(doc_context, table.caption, batch)
             cached = _load_table_cache(cache_key)
             if cached is not None:
@@ -584,6 +619,31 @@ def _extract_table_facts(
                 try:
                     prompt = _build_table_prompt(doc_context, table.caption, batch)
                     response, model_used = providers.generate(prompt, TableExtractionResponse, rotator)
+                except providers.PayloadTooLargeError as exc:
+                    if len(batch) <= 1:
+                        logger.error(
+                            "table batch %d (page %d): a single cell still triggers 413, giving up: %s",
+                            batch_index, page_no, exc,
+                        )
+                        result.failed_batches.append(
+                            BatchFailure(
+                                batch_index=batch_index,
+                                page_range=(page_no, page_no),
+                                block_count=len(batch),
+                                error=str(exc),
+                            )
+                        )
+                        batch_index += 1
+                        continue
+                    mid = len(batch) // 2
+                    logger.warning(
+                        "table batch %d (page %d, %d cells) got 413 Payload Too Large — "
+                        "splitting into %d + %d cell(s) and retrying",
+                        batch_index, page_no, len(batch), mid, len(batch) - mid,
+                    )
+                    queue.appendleft(batch[mid:])
+                    queue.appendleft(batch[:mid])
+                    continue
                 except (errors.APIError, AllKeysExhaustedError) as exc:
                     logger.error(
                         "table batch %d (page %d, %d cells) failed after retries, skipping: %s",
@@ -600,6 +660,7 @@ def _extract_table_facts(
                             error=str(exc),
                         )
                     )
+                    batch_index += 1
                     continue
                 _save_table_cache(cache_key, response, model_used)
 
@@ -619,6 +680,7 @@ def _extract_table_facts(
                     continue
                 if gate.verify(fact, source_block.text):
                     result.facts.append(fact)
+            batch_index += 1
 
 
 def extract_facts(
@@ -666,7 +728,14 @@ def extract_facts(
     batches = _make_batches(tagged)
 
     result = ExtractionResult()
-    for batch_index, batch in enumerate(batches):
+    # A deque, not enumerate(batches): a 413 (see providers.PayloadTooLargeError)
+    # splits the current batch in half and re-queues both halves in place,
+    # rather than recording a permanent failure or falling through to
+    # Gemini with the same oversized prompt.
+    queue: deque[list[tuple[Block, str | None]]] = deque(batches)
+    batch_index = 0
+    while queue:
+        batch = queue.popleft()
         cache_key = _batch_cache_key(doc_context, batch)
         cached = _load_cache(cache_key)
         if cached is not None:
@@ -686,6 +755,31 @@ def extract_facts(
             try:
                 prompt = _build_prompt(doc_context, batch)
                 response, model_used = providers.generate(prompt, ExtractionResponse, rotator)
+            except providers.PayloadTooLargeError as exc:
+                if len(batch) <= 1:
+                    logger.error(
+                        "batch %d (pages %d-%d): a single block still triggers 413, giving up: %s",
+                        batch_index, min(page_nos), max(page_nos), exc,
+                    )
+                    result.failed_batches.append(
+                        BatchFailure(
+                            batch_index=batch_index,
+                            page_range=(min(page_nos), max(page_nos)),
+                            block_count=len(batch),
+                            error=str(exc),
+                        )
+                    )
+                    batch_index += 1
+                    continue
+                mid = len(batch) // 2
+                logger.warning(
+                    "batch %d (pages %d-%d, %d blocks) got 413 Payload Too Large — "
+                    "splitting into %d + %d block(s) and retrying",
+                    batch_index, min(page_nos), max(page_nos), len(batch), mid, len(batch) - mid,
+                )
+                queue.appendleft(batch[mid:])
+                queue.appendleft(batch[:mid])
+                continue
             except (errors.APIError, AllKeysExhaustedError) as exc:
                 logger.error(
                     "batch %d (pages %d-%d, %d blocks) failed after retries, skipping: %s",
@@ -703,6 +797,7 @@ def extract_facts(
                         error=str(exc),
                     )
                 )
+                batch_index += 1
                 continue
             _save_cache(cache_key, response, model_used)
 
@@ -714,6 +809,7 @@ def extract_facts(
             fact = _to_fact(extracted, block, heading, doc_id, model_used)
             if fact is not None and gate.verify(fact, block.text):
                 result.facts.append(fact)
+        batch_index += 1
 
     if table_blocks:
         _extract_table_facts(blocks, doc_context, pdf_path, rotator, result, gate)

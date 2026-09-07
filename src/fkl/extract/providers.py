@@ -4,16 +4,24 @@ can reuse the exact same rotation/retry/fallback logic against a third
 response schema, rather than reimplementing it or reaching into another
 module's private names.
 
-Providers: Groq (OpenAI-compatible endpoint, JSON mode, GROQ_API_KEY) is the
-default. Gemini is the fallback when Groq fails, and the sole provider for
-anything needing native image input (e.g. slide/vision extraction), which
-Groq's endpoint here is too text-only for.
+Providers: Groq (OpenAI-compatible endpoint, JSON mode) is the default.
+Gemini is the fallback when Groq fails, and the sole provider for anything
+needing native image input (e.g. slide/vision extraction), which Groq's
+endpoint here is too text-only for.
 
-Gemini API keys: reads GOOGLE_API_KEYS (comma-separated) from .env, falling
-back to a single GOOGLE_API_KEY for backward compatibility. A 429 whose
-quota violation is a daily cap rotates immediately to the next key (see
-KeyRotator); a 429 that's a per-minute rate limit, or a 5xx, keeps the same
-key and backs off exponentially (see is_retryable).
+Both providers rotate across multiple API keys the same way: a 429 whose
+quota violation is a daily cap rotates immediately to the next key, with no
+wait (since a daily cap won't clear by waiting); a 429 that's a per-minute
+rate limit, or a 5xx, keeps the same key and backs off exponentially.
+- Gemini: reads GOOGLE_API_KEYS (comma-separated) from .env, falling back
+  to a single GOOGLE_API_KEY for backward compatibility (see KeyRotator,
+  is_retryable, is_daily_quota_error).
+- Groq: reads GROQ_API_KEYS (comma-separated) from .env, falling back to a
+  single GROQ_API_KEY for backward compatibility (see GroqKeyRotator,
+  _is_retryable_groq, _is_daily_quota_error_groq). Groq is the primary
+  provider here, so it needs rotation more than Gemini's fallback path
+  does — it burns through its own rate-limit budget far faster in
+  practice.
 """
 
 from __future__ import annotations
@@ -194,13 +202,35 @@ class KeyRotator:
                 raise
 
 
+def _is_daily_quota_error_groq(exc: httpx.HTTPStatusError) -> bool:
+    """True for a 429 whose message names a per-DAY (RPD) limit rather than
+    a transient per-minute/per-second rate limit — mirrors
+    is_daily_quota_error's role for Gemini. Groq's rate-limit error text
+    looks like 'Rate limit reached for model `X` ... on requests per day
+    (RPD): Limit 14400, Used 14400, Requested 1. Please try again in
+    23h59m59s.' for a hard daily cap, vs '... requests per minute (RPM) ...'
+    or '... tokens per minute (TPM) ...' for the transient case that should
+    just back off on the same key instead of rotating."""
+    try:
+        message = str(exc.response.json().get("error", {}).get("message", ""))
+    except Exception:
+        message = exc.response.text if exc.response is not None else ""
+    text = message.lower()
+    return "per day" in text or "(rpd)" in text
+
+
 def _is_retryable_groq(exc: BaseException) -> bool:
-    """429 and 5xx get exponential backoff, same policy as Gemini's
-    is_retryable. A network-level failure (timeout, connection error) is
-    also retried; a non-retryable HTTP error (e.g. 400/401) is not — it will
-    just fail the same way again, so fail fast into the Gemini fallback."""
+    """5xx and a per-minute/per-second 429 get exponential backoff, same
+    policy as Gemini's is_retryable. A daily-quota 429 is explicitly
+    excluded here — GroqKeyRotator.generate handles that by switching keys
+    immediately, with no wait, same split as Gemini's is_retryable /
+    KeyRotator. A network-level failure (timeout, connection error) is also
+    retried; a non-retryable HTTP error (e.g. 400/401) is not — it will just
+    fail the same way again, so fail fast into the Gemini fallback."""
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code == 429 or exc.response.status_code >= 500
+        if exc.response.status_code == 429:
+            return not _is_daily_quota_error_groq(exc)
+        return exc.response.status_code >= 500
     return isinstance(exc, httpx.TransportError)
 
 
@@ -210,7 +240,7 @@ def _is_retryable_groq(exc: BaseException) -> bool:
     stop=stop_after_attempt(6),
     reraise=True,
 )
-def _groq_chat_completion(prompt: str) -> str:
+def _groq_chat_completion(prompt: str, api_key: str) -> str:
     """max_completion_tokens matters here more than it would for a plain
     chat reply: with no explicit value set, a real live call against a
     3-block batch came back with finish_reason="length" — the response was
@@ -220,7 +250,6 @@ def _groq_chat_completion(prompt: str) -> str:
     comfortably under gpt-oss-120b's 65536 completion-token ceiling and
     well above what any single extraction batch (capped at
     BATCH_CHAR_BUDGET input characters) should ever need to fully emit."""
-    api_key = os.environ["GROQ_API_KEY"]
     response = httpx.post(
         f"{GROQ_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -235,6 +264,104 @@ def _groq_chat_completion(prompt: str) -> str:
     )
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
+
+
+class GroqKeyRotator:
+    """Round-robins across GROQ_API_KEYS, mirroring KeyRotator's
+    exhaustion-and-rotate logic (see its docstring) but adapted to Groq's
+    httpx-based errors via _is_daily_quota_error_groq. Groq is the primary
+    provider here (Gemini is only the fallback), so it burns through its
+    own rate-limit budget far faster in practice — rotation matters more
+    for Groq than it does for Gemini.
+
+    Safe to share across threads, same locking discipline as KeyRotator:
+    _lock guards key-selection state only, released before the network
+    call itself."""
+
+    def __init__(self, api_keys: list[str]):
+        if not api_keys:
+            raise ValueError("GroqKeyRotator requires at least one API key")
+        self._api_keys = api_keys
+        self._exhausted: set[int] = set()
+        self._current = 0
+        self._lock = threading.RLock()
+
+    @classmethod
+    def from_env(cls) -> GroqKeyRotator:
+        load_dotenv()
+        raw = os.environ.get("GROQ_API_KEYS", "")
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+        if not keys:
+            # Backward compatibility: a single GROQ_API_KEY still works,
+            # just with no rotation (a 1-key rotator).
+            single = os.environ.get("GROQ_API_KEY", "").strip()
+            keys = [single] if single else []
+        if not keys:
+            raise RuntimeError(
+                "no Groq API key found: set GROQ_API_KEYS (comma-separated) or "
+                "GROQ_API_KEY in .env"
+            )
+        return cls(keys)
+
+    def __len__(self) -> int:
+        return len(self._api_keys)
+
+    def current_index(self) -> int:
+        with self._lock:
+            return self._current
+
+    def _advance(self) -> None:
+        # caller already holds _lock
+        total = len(self._api_keys)
+        for offset in range(1, total + 1):
+            candidate = (self._current + offset) % total
+            if candidate not in self._exhausted:
+                self._current = candidate
+                return
+
+    def generate(self, prompt: str) -> str:
+        total = len(self._api_keys)
+        while True:
+            with self._lock:
+                if len(self._exhausted) >= total:
+                    raise AllKeysExhaustedError(f"all {total} Groq API key(s) exhausted their daily quota")
+                if self._current in self._exhausted:
+                    self._advance()
+                    continue
+                current_index = self._current
+                api_key = self._api_keys[current_index]
+            # Lock released here, same rationale as KeyRotator.generate.
+            try:
+                return _groq_chat_completion(prompt, api_key)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429 and _is_daily_quota_error_groq(exc):
+                    with self._lock:
+                        self._exhausted.add(current_index)
+                        logger.warning(
+                            "Groq key index %d exhausted its daily quota (%d/%d keys exhausted so far)",
+                            current_index,
+                            len(self._exhausted),
+                            total,
+                        )
+                        self._advance()
+                    continue
+                raise
+
+
+_groq_rotator: GroqKeyRotator | None = None
+_groq_rotator_lock = threading.Lock()
+
+
+def _get_groq_rotator() -> GroqKeyRotator:
+    """Lazy process-wide singleton so callers of generate() don't need to
+    thread a Groq rotator through the same call chains that already pass
+    around a Gemini KeyRotator (extractor.py, pipeline.py,
+    reconcile/adjudicator.py) — those signatures stay unchanged."""
+    global _groq_rotator
+    with _groq_rotator_lock:
+        if _groq_rotator is None:
+            _groq_rotator = GroqKeyRotator.from_env()
+        return _groq_rotator
 
 
 def _append_json_schema_instructions(prompt: str, response_model: type[BaseModel]) -> str:
@@ -252,8 +379,17 @@ def _append_json_schema_instructions(prompt: str, response_model: type[BaseModel
 
 
 def call_groq(prompt: str, response_model: type[_ResponseT]) -> _ResponseT:
-    content = _groq_chat_completion(_append_json_schema_instructions(prompt, response_model))
+    full_prompt = _append_json_schema_instructions(prompt, response_model)
+    content = _get_groq_rotator().generate(full_prompt)
     return response_model.model_validate_json(content)
+
+
+class PayloadTooLargeError(RuntimeError):
+    """Groq returned 413 Payload Too Large. This is a batch-sizing problem,
+    not a provider problem — falling back to Gemini would just resend the
+    SAME oversized prompt to a different endpoint. The caller (extractor.py)
+    is expected to catch this specifically and shrink the batch, not treat
+    it like any other Groq failure."""
 
 
 def generate(
@@ -265,15 +401,28 @@ def generate(
     failure that survives Groq's own retry budget — a non-retryable HTTP
     error, retries exhausted, or a response that doesn't validate against
     the schema — falls back to the existing Gemini key-rotation path
-    rather than losing the call.
+    rather than losing the call. The one exception is 413 (see
+    PayloadTooLargeError), which is never retried here and never falls
+    through to Gemini.
 
     Returns (response, model_used) — the caller needs to know which
     provider actually served the request for Fact.provenance.model (or a
     Relation's provenance) to be honest about it, not just always claim
-    whichever model is the default.
+    whichever model is the default. Groq itself rotates across
+    GROQ_API_KEYS internally (see GroqKeyRotator) before any of this falls
+    back to Gemini at all — Groq is the primary provider, so it needs its
+    own key rotation more than Gemini's fallback path does.
     """
     try:
         return call_groq(prompt, response_model), GROQ_MODEL
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 413:
+            raise PayloadTooLargeError(str(exc)) from exc
+        logger.warning("Groq call failed (%s), falling back to Gemini", exc)
+        return rotator.generate(prompt, response_model), MODEL_NAME
+    except AllKeysExhaustedError as exc:
+        logger.warning("All Groq keys exhausted (%s), falling back to Gemini", exc)
+        return rotator.generate(prompt, response_model), MODEL_NAME
     except (httpx.HTTPError, ValidationError) as exc:
         logger.warning("Groq call failed (%s), falling back to Gemini", exc)
         return rotator.generate(prompt, response_model), MODEL_NAME
