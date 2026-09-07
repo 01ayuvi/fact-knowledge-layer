@@ -25,12 +25,20 @@ class RelationType(str, Enum):
 
 
 class ReasonCode(str, Enum):
-    """Closed vocabulary from the plan's §2 D3 table, plus two additions
-    identified in docs/CASE_DOSSIER.md: TEMPORAL_STATE_CHANGE (Morparia-style
-    validity-interval supersession) and ROUNDING_ARTIFACT (sub-tolerance
-    numeric drift, e.g. the FY23 7,224 vs 7,225 Cr split)."""
+    """Closed vocabulary from the plan's §2 D3 table, minus CORROBORATES and
+    CONTRADICTS (those are RelationTypes — the verdict — not reasons; a
+    reason_code must never just restate the relation's own type), plus
+    additions: VALUES_MATCH / SCALE_NORMALIZED (why a CORROBORATES relation
+    holds — raw match vs. match only after scale normalization),
+    VALUES_DIVERGE (why a CONTRADICTS relation holds when no explanatory
+    dimension — scale, unit, period, scope, geography, modality, vintage —
+    accounts for the difference), TEMPORAL_STATE_CHANGE (Morparia-style
+    validity-interval supersession, from docs/CASE_DOSSIER.md), and
+    ROUNDING_ARTIFACT (sub-tolerance numeric drift, e.g. the FY23 7,224 vs
+    7,225 Cr split, also from the dossier)."""
 
-    CORROBORATES = "CORROBORATES"
+    VALUES_MATCH = "VALUES_MATCH"
+    SCALE_NORMALIZED = "SCALE_NORMALIZED"
     SCALE_MISMATCH = "SCALE_MISMATCH"
     UNIT_MISMATCH = "UNIT_MISMATCH"
     PERIOD_DISJOINT = "PERIOD_DISJOINT"
@@ -39,7 +47,7 @@ class ReasonCode(str, Enum):
     GEOGRAPHY_MISMATCH = "GEOGRAPHY_MISMATCH"
     MODALITY_MISMATCH = "MODALITY_MISMATCH"
     VINTAGE_RESTATEMENT = "VINTAGE_RESTATEMENT"
-    CONTRADICTS = "CONTRADICTS"
+    VALUES_DIVERGE = "VALUES_DIVERGE"
     UNRESOLVED = "UNRESOLVED"
     TEMPORAL_STATE_CHANGE = "TEMPORAL_STATE_CHANGE"
     ROUNDING_ARTIFACT = "ROUNDING_ARTIFACT"
