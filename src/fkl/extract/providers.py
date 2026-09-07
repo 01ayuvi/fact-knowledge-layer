@@ -194,6 +194,15 @@ def _is_retryable_groq(exc: BaseException) -> bool:
     reraise=True,
 )
 def _groq_chat_completion(prompt: str) -> str:
+    """max_completion_tokens matters here more than it would for a plain
+    chat reply: with no explicit value set, a real live call against a
+    3-block batch came back with finish_reason="length" — the response was
+    truncated mid-JSON, which then fails Groq's own json_object validation
+    as a 400 "json_validate_failed" (not a transient error, so it was never
+    retried; it just silently produced zero facts for that batch). 16000 is
+    comfortably under gpt-oss-120b's 65536 completion-token ceiling and
+    well above what any single extraction batch (capped at
+    BATCH_CHAR_BUDGET input characters) should ever need to fully emit."""
     api_key = os.environ["GROQ_API_KEY"]
     response = httpx.post(
         f"{GROQ_BASE_URL}/chat/completions",
@@ -203,6 +212,7 @@ def _groq_chat_completion(prompt: str) -> str:
             "messages": [{"role": "user", "content": prompt}],
             "response_format": {"type": "json_object"},
             "temperature": 0,
+            "max_completion_tokens": 16000,
         },
         timeout=120,
     )
