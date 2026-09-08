@@ -278,6 +278,8 @@ Every observed limitation below was found by running the system against the corp
 
 **Provider failures.** Groq was found to truncate output mid-JSON when `max_completion_tokens` was not configured; the malformed response was then rejected as a non-retryable 400 and produced a zero-fact batch without surfacing the underlying failure. Large batches also produced HTTP 413 payload errors. These findings led to bounded batches, explicit completion limits, retry handling, caching, and provider fallback. The pipeline now continues through total provider failure, logging failed batches rather than losing the documents already processed.
 
+**Free-tier quota bounds throughput.** A 100-page document needs roughly 200 LLM calls. Both Groq and Gemini free tiers were exhausted during final testing. Extraction is content-hash cached and the repository ships a seeded `data/store.db`, so the system can be explored end-to-end without any API key — see [Offline demo mode](#offline-demo-mode).
+
 **Incremental-ingest recovery.** Incremental skipping is currently keyed on document presence rather than successful completion, so a partially failed ingest may need to be cleared manually before it can be retried.
 
 **Explanation throughput.** Natural-language explanations require one LLM call per relationship pair. In testing, 59 pairs took approximately 6.5 minutes under provider rate limiting, even after parallelizing across four workers. This is acceptable for a prototype but would become a bottleneck for larger knowledge layers.

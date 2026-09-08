@@ -86,3 +86,22 @@ Closing the measure-surface-form recall gap (embeddings, or a broader alias
 table) is a second, separate fix also not attempted. The video's
 genuine-contradiction case uses a different, real pair instead (see
 `docs/FOUR_CASES.md` §2).
+
+## Free-tier quota bounds throughput (`src/fkl/extract/providers.py`)
+
+A 100-page document needs roughly 200 LLM calls. Both Groq and Gemini free
+tiers were exhausted during final testing — confirmed live: all 5 Groq keys
+sitting at ~199,600–199,996 of their 200,000 daily token budget, and all 5
+Gemini fallback keys hitting daily quota within seconds of each other, on
+runs as small as one 5-page document. Groq's TPD quota is a rolling window
+(see `_parse_retry_after_seconds`), so exactly which calls succeed vs. fail
+shifts run to run rather than failing the same way twice.
+
+This isn't a code defect to fix — it's the real ceiling of two free tiers
+under this session's cumulative testing volume, not a per-document problem.
+Extraction is cached by content hash and prompt version (`PROMPT_VERSION`),
+so a re-run of anything already processed costs zero extraction calls
+regardless of quota state, and the repository ships a seeded
+`data/store.db` (see the README's "Offline demo mode") so the system can be
+explored — facts, quarantine queue, reconciled relations, evidence — fully
+end to end without any API key at all.
