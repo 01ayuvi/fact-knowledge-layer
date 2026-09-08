@@ -49,23 +49,25 @@ prompt edit invalidates the whole cache and forces a full, costly re-run across
 every document already ingested. Deferred until there's a natural reason to bump
 the prompt version anyway.
 
-## `validity_interval` is never populated by extraction (`src/fkl/extract/extractor.py`)
+## Unreachable relation type: SUPERSEDES/TEMPORAL_STATE_CHANGE (`src/fkl/extract/extractor.py`, `src/fkl/reconcile/rules.py`)
 
-`reconcile/rules.py`'s SUPERSEDES/`TEMPORAL_STATE_CHANGE` branch — the dossier's
-§2 case: a Non-Executive Independent Director role stated as current in the 2022
-prospectus, then "(resigned w.e.f. February 11, 2023)" in the FY24 annual report
-— depends entirely on `Fact.validity_interval` holding real, non-overlapping
-date bounds. `extractor.py` never sets it: `grep -rn validity_interval
-src/fkl/extract/extractor.py` returns nothing. Every extracted Fact keeps the
-model's default `(None, None)`, which `_intervals_overlap()` treats as
-unbounded — i.e. maximally overlapping — so the SUPERSEDES check can never
-fire on real extracted data, regardless of how correct the underlying dates
-are. `tests/test_reconcile_rules.py::test_dossier_case2_morparia_supersedes_critical`
-only proves the *rules* branch is correct; it constructs `validity_start`/
-`validity_end` by hand, which is not something anything upstream of it does.
+`SUPERSEDES`/`TEMPORAL_STATE_CHANGE` is implemented, tested, and unreachable
+in practice. Extraction never populates `Fact.validity_interval` — `grep -rn
+validity_interval src/fkl/extract/extractor.py` returns nothing — so it
+defaults to `(None, None)`, which `_intervals_overlap()`'s overlap check
+reads as fully overlapping. The supersession branch in `reconcile/rules.py`
+can therefore never fire on real data, regardless of how correct the
+underlying dates are. `tests/test_reconcile_rules.py::
+test_dossier_case2_morparia_supersedes_critical` passes because it
+constructs `validity_start`/`validity_end` by hand, which is not something
+anything upstream of it does — the test proves the rules branch is correct,
+not that the system can reach it.
 
-Confirmed live on the real Morparia pair (prospectus p88 + annual report p91,
-both narrowly extracted and persisted to `data/store.db` for this check):
+Found by attempting the dossier's §2 director state-change case end-to-end
+rather than trusting the unit test: a Non-Executive Independent Director
+role stated as current in the 2022 prospectus (p88), then "(resigned w.e.f.
+February 11, 2023)" in the FY24 annual report (p91). Both facts were
+extracted for real and persisted to `data/store.db` to check this.
 `reconcile()` on the two actual extracted facts returns
 `RECONCILED_BY_CONTEXT`/`UNRESOLVED`, not `SUPERSEDES` — and not even
 `CONTRADICTS`, because a second, compounding gap hits first: the two facts'
@@ -77,12 +79,10 @@ linking *candidates* in the real pipeline, the recall gap already noted
 above under "Anticipated limitations" in the README, now confirmed to
 actually occur rather than just being theoretically possible.
 
-Left unfixed for now: closing this needs two real changes, not a config
-tweak — (1) deriving `validity_interval` from qualifiers the extractor
-already captures in some cases (e.g. `effective_date`, "w.e.f."/"resigned"
-language) or a dedicated normalizer pass, and (2) improving measure-surface-
-form recall (embeddings, or a broader alias table) so differently-phrased
-mentions of the same fact become comparable at all. Both are bigger than a
-targeted fix and were deferred rather than rushed under time pressure; the
-video's genuine-contradiction case uses a different, real pair instead (see
+The fix is to derive validity intervals from qualifiers during extraction
+(e.g. `effective_date`, "w.e.f."/"resigned" language the extractor already
+captures in some cases) — this was not attempted under time constraints.
+Closing the measure-surface-form recall gap (embeddings, or a broader alias
+table) is a second, separate fix also not attempted. The video's
+genuine-contradiction case uses a different, real pair instead (see
 `docs/FOUR_CASES.md` §2).
