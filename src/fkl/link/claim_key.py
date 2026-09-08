@@ -24,20 +24,9 @@ from dataclasses import dataclass
 from datetime import date
 
 from src.fkl.normalize.entities import canonicalize
+from src.fkl.normalize.measures import canonicalize_measure
 from src.fkl.normalize.periods import parse_period
 from src.fkl.store.models import Fact
-
-
-def normalize_measure(surface_form: str) -> str:
-    """No measures.py normalizer exists yet (out of scope here) -- light
-    string normalization only (NFKC, lowercase, collapse whitespace).
-    Deliberately does NOT alias "revenue from operations" to "revenue from
-    services": those genuinely differ (docs/CASE_DOSSIER.md §1's explicit
-    trap -- they only coincide because FY24 traded-goods revenue was ~0),
-    and silently merging them here would hide that instead of surfacing it
-    as the caveated CORROBORATES the dossier calls for."""
-    text = unicodedata.normalize("NFKC", surface_form).strip().lower()
-    return re.sub(r"\s+", " ", text)
 
 
 def normalize_qualifier(value: object) -> str | None:
@@ -48,13 +37,35 @@ def normalize_qualifier(value: object) -> str | None:
 
 
 def fact_period(fact: Fact) -> tuple[date | None, date | None]:
-    """Resolves the fact's period to a concrete (start, end) interval.
-    Prefers already-resolved period_start/period_end qualifiers (set
-    deterministically for table facts by
-    extractor.py's _deterministic_qualifiers_from_header); falls back to
-    parsing period_label through normalize/periods.py. Returns (None,
-    None) if neither is present or parseable."""
+    """Resolves the fact's period to a concrete (start, end) interval, most
+    precise available signal first:
+
+    1. a `date` qualifier -- a single calendar date, strictly more precise
+       than any range. Folded in as a same-day (date, date) interval so
+       two facts that share a fiscal-year period_label but sit on
+       different specific dates (e.g. a monthly ESOP-exercise table: 12
+       rows, one per month, all carrying period_label "FY2023-24" but each
+       with its own `date`) no longer collapse onto the SAME claim key and
+       get diffed against each other as if they were repeated measurements
+       of one thing -- see docs/LIMITATIONS.md's 105/107 false-CONTRADICTS
+       incident. Distinct dates now correctly resolve as non-overlapping
+       periods (PERIOD_DISJOINT in reconcile/rules.py), not a value
+       disagreement.
+    2. already-resolved period_start/period_end qualifiers (set
+       deterministically for table facts by extractor.py's
+       _deterministic_qualifiers_from_header) -- a resolved range, more
+       precise than a label still needing parsing.
+    3. period_label, parsed through normalize/periods.py.
+
+    Returns (None, None) if nothing above is present or parseable."""
     q = fact.qualifiers
+    date_raw = q.get("date")
+    if date_raw:
+        try:
+            d = date.fromisoformat(str(date_raw))
+            return d, d
+        except ValueError:
+            pass
     start_raw, end_raw = q.get("period_start"), q.get("period_end")
     if start_raw and end_raw:
         try:
@@ -83,7 +94,14 @@ def claim_key_components(fact: Fact) -> ClaimKeyComponents:
     period_start, period_end = fact_period(fact)
     return ClaimKeyComponents(
         subject_id=canonicalize(fact.subject.surface_form),
-        measure_key=normalize_measure(fact.measure.surface_form),
+        # canonicalize_measure folds a KNOWN alias group (e.g. "Revenue for
+        # services" / "Revenue from customers" -> "Revenue from Operations",
+        # see normalize/measures.py) onto one measure_key so aliased facts
+        # become CANDIDATES for reconciliation — but aliasing is not the
+        # same as identity: reconcile/rules.py checks
+        # measures_aliased_not_identical() separately and must caveat any
+        # resulting CORROBORATES, never treat the match as unqualified.
+        measure_key=canonicalize_measure(fact.measure.surface_form),
         period_start=period_start,
         period_end=period_end,
         consolidation=normalize_qualifier(fact.qualifiers.get("consolidation")),

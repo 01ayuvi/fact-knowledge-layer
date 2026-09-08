@@ -223,3 +223,51 @@ def test_reconcile_is_symmetric_on_verdict_type():
     backward = reconcile(fact_b, fact_a)
     assert forward.type == backward.type == RelationType.CORROBORATES
     assert forward.reason_code == backward.reason_code == ReasonCode.VALUES_MATCH
+
+
+def test_aliased_measures_corroborate_with_caveat():
+    """The real, non-idealized dossier §1 case: DIFFERENT measure surface
+    forms ("Revenue from Operations" vs "Revenue for services (A)"),
+    linked only via normalize/measures.py's alias table. A resulting
+    CORROBORATES must carry the caveat and be forced to SCALE_NORMALIZED
+    -- never presented as an unqualified match, since the deck's own
+    footnote says revenue from services excludes traded-goods revenue, a
+    narrower definition than Revenue from Operations."""
+    fact_a = make_fact(
+        measure="Revenue from Operations",
+        value_raw="₹81,415.38 million",
+        qualifiers={"period_label": "FY24", "consolidation": "consolidated"},
+    )
+    fact_b = make_fact(
+        measure="Revenue for services (A)",
+        value_raw="₹8,142 Cr",
+        qualifiers={"period_label": "FY24"},  # no consolidation stated -- a deck, not a filing
+    )
+    relation = reconcile(fact_a, fact_b)
+    assert relation.type == RelationType.CORROBORATES
+    assert relation.reason_code == ReasonCode.SCALE_NORMALIZED
+    assert relation.caveat is not None
+    assert "Revenue from Operations" in relation.caveat
+    assert "Revenue for services (A)" in relation.caveat
+
+
+def test_identically_worded_measures_never_get_a_caveat():
+    """No alias was needed to link this pair -- same literal wording -- so
+    no caveat should appear even though the values corroborate."""
+    fact_a = make_fact(value_raw="₹100 million", qualifiers={"period_label": "FY24", "consolidation": "consolidated"})
+    fact_b = make_fact(value_raw="₹100 million", qualifiers={"period_label": "FY24", "consolidation": "consolidated"})
+    relation = reconcile(fact_a, fact_b)
+    assert relation.caveat is None
+
+
+def test_consolidation_silence_on_one_side_is_not_a_mismatch():
+    """One side simply not stating a consolidation basis (e.g. an investor
+    deck, which never uses the word) must not be treated as a CONFIRMED
+    scope mismatch the way two differing STATED bases would be -- see
+    dossier_case3a_scope_mismatch above for the case that must still
+    trigger it."""
+    fact_a = make_fact(value_raw="₹100 million", qualifiers={"period_label": "FY24", "consolidation": "consolidated"})
+    fact_b = make_fact(value_raw="₹100 million", qualifiers={"period_label": "FY24"})
+    relation = reconcile(fact_a, fact_b)
+    assert relation.type == RelationType.CORROBORATES
+    assert relation.reason_code != ReasonCode.SCOPE_MISMATCH

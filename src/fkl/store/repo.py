@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -91,6 +90,8 @@ CREATE TABLE IF NOT EXISTS relations (
     type TEXT NOT NULL,
     reason_code TEXT NOT NULL,
     explanation TEXT NOT NULL,
+    explanation_pending INTEGER NOT NULL DEFAULT 0,
+    caveat TEXT,
     delta TEXT,
     confidence REAL NOT NULL,
     adjudicator TEXT NOT NULL,
@@ -172,6 +173,12 @@ def _row_to_fact(row: sqlite3.Row) -> Fact:
 
 
 def _relation_row(relation: Relation) -> dict[str, Any]:
+    # explanation stays a NOT NULL TEXT column (no risky migration to drop
+    # that constraint on the real store.db) -- "" at the storage layer
+    # means the same thing None does on the Relation model. explanation_
+    # pending is the actual signal for "prose is missing"; the empty
+    # string is never shown to a caller as if it were real narration (see
+    # _row_to_relation's `or None`).
     fact_a_id, fact_b_id = sorted((relation.fact_a_id, relation.fact_b_id))
     return {
         "id": relation.id,
@@ -179,7 +186,9 @@ def _relation_row(relation: Relation) -> dict[str, Any]:
         "fact_b_id": fact_b_id,
         "type": relation.type.value,
         "reason_code": relation.reason_code.value,
-        "explanation": relation.explanation,
+        "explanation": relation.explanation or "",
+        "explanation_pending": 1 if relation.explanation_pending else 0,
+        "caveat": relation.caveat,
         "delta": json.dumps(relation.delta.model_dump(mode="json")) if relation.delta else None,
         "confidence": relation.confidence,
         "adjudicator": relation.adjudicator,
@@ -193,7 +202,9 @@ def _row_to_relation(row: sqlite3.Row) -> Relation:
         fact_b_id=row["fact_b_id"],
         type=RelationType(row["type"]),
         reason_code=ReasonCode(row["reason_code"]),
-        explanation=row["explanation"],
+        explanation=row["explanation"] or None,
+        explanation_pending=bool(row["explanation_pending"]),
+        caveat=row["caveat"],
         delta=Delta.model_validate(json.loads(row["delta"])) if row["delta"] else None,
         confidence=row["confidence"],
         adjudicator=row["adjudicator"],
@@ -219,7 +230,22 @@ class Repo:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """CREATE TABLE IF NOT EXISTS is a no-op against a table that
+        already exists from before a schema change — a database created
+        before explanation_pending was added needs it backfilled
+        explicitly. Safe to run every startup: checked via PRAGMA
+        table_info first, so already-migrated databases (including a
+        brand-new one, whose CREATE TABLE above already included the
+        column) just skip it."""
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(relations)")}
+        if "explanation_pending" not in columns:
+            self.conn.execute("ALTER TABLE relations ADD COLUMN explanation_pending INTEGER NOT NULL DEFAULT 0")
+        if "caveat" not in columns:
+            self.conn.execute("ALTER TABLE relations ADD COLUMN caveat TEXT")
 
     def close(self) -> None:
         self.conn.close()
@@ -351,9 +377,17 @@ class Repo:
     # -- quarantine --
 
     def add_quarantine(self, doc_id: str, fact: Fact, reason: str, score: float) -> None:
+        """id reuses fact.id (a quarantined candidate is never also
+        persisted as a real Fact, so there's no collision risk) with
+        INSERT OR IGNORE, same idempotency contract as add_fact — re-adding
+        the same fact's quarantine entry is a no-op. This matters now that
+        a batch's quarantine entries can be persisted incrementally as soon
+        as that batch finishes (see extract_facts()'s on_batch) as well as
+        from a document's full final result; both must be safe to call for
+        the same entry without creating duplicate rows."""
         self.conn.execute(
-            "INSERT INTO quarantined (id, doc_id, fact_id, fact, reason, score) VALUES (?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), doc_id, fact.id, fact.model_dump_json(), reason, score),
+            "INSERT OR IGNORE INTO quarantined (id, doc_id, fact_id, fact, reason, score) VALUES (?, ?, ?, ?, ?, ?)",
+            (fact.id, doc_id, fact.id, fact.model_dump_json(), reason, score),
         )
         self.conn.commit()
 

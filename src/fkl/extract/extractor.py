@@ -20,12 +20,11 @@ import json
 import logging
 import os
 import re
-import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from dotenv import load_dotenv
 from google.genai import errors
@@ -73,6 +72,12 @@ TABLE_PROMPT_VERSION = "extract-table-v4"
 CONSOLIDATION_RE = re.compile(r"\b(standalone|consolidated)\b", re.IGNORECASE)
 DATE_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 FY_LABEL_RE = re.compile(r"FY\s?(\d{2})\b")
+# A column header that IS just a bare fiscal-year label ("FY24", not
+# "Q4 FY24" -- the ^...$ anchors exclude the quarter-prefixed case, a
+# narrower period this doesn't attempt to resolve) needs no cross-
+# referencing against doc_context.reporting_period at all: the label
+# itself already says what fiscal year the column covers.
+BARE_FY_LABEL_RE = re.compile(r"^FY\s?\d{2}$", re.IGNORECASE)
 
 
 class QualifierKV(BaseModel):
@@ -283,6 +288,37 @@ def _save_cache(key: str, response: ExtractionResponse, model_used: str) -> None
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _deterministic_fact_id(fact: Fact) -> str:
+    """Fact identity must be a function of content, not a random UUID —
+    otherwise re-extracting the SAME batch (e.g. a cache-hit replay on a
+    resumed ingest, where the LLM call is skipped but _to_fact/_to_table_fact
+    still runs) mints a fresh id every time, and repo.add_fact's INSERT OR
+    IGNORE (keyed on id) silently persists a full duplicate instead of
+    recognizing "already have this" — see the 298-duplicate incident from a
+    resumed Delhivery ingest (docs/LIMITATIONS.md). A sha256 over the fields
+    that define "the same claim" makes replay genuinely idempotent, cache
+    hit or not.
+
+    Call this AFTER GroundingGate.verify()/quarantine() has had its chance
+    to correct evidence.char_start/char_end — fuzzy grounding is itself
+    deterministic for identical (doc, block, quote) input, so hashing
+    whatever offsets are on the fact at that point (corrected on a pass,
+    still the (0, len(quote)) placeholder on a quarantine) is exactly as
+    reproducible across a cache-hit replay as any other field here."""
+    payload = "|".join(
+        [
+            fact.doc_id,
+            fact.block_id,
+            fact.subject.canonical_id,
+            fact.measure.canonical_id,
+            fact.value.raw,
+            str(fact.evidence.char_start),
+            str(fact.evidence.char_end),
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _to_fact(
     extracted: ExtractedFact,
     block: Block,
@@ -294,7 +330,9 @@ def _to_fact(
     len(quote)) — NOT grounding-verified yet. The caller must run this
     through GroundingGate.verify(), which corrects char_start/char_end on
     pass or quarantines the fact on fail; nothing here decides groundedness
-    anymore (see grounding_gate.py)."""
+    anymore (see grounding_gate.py). id is left as a placeholder — the
+    caller must set it via _deterministic_fact_id() AFTER verify()/
+    quarantine() has run, once evidence offsets are in their final state."""
     if not extracted.subject_surface_form.strip():
         logger.warning(
             "dropping fact with no subject: %r (page %d block %d)",
@@ -309,7 +347,7 @@ def _to_fact(
         qualifiers["period_resolved"] = str(qualifiers["period_resolved"]).strip().lower() != "false"
 
     return Fact(
-        id=str(uuid.uuid4()),
+        id="",
         doc_id=doc_id,
         block_id=f"{doc_id}:p{block.page_no}:b{block.block_no}",
         subject=Entity(
@@ -361,15 +399,25 @@ def _deterministic_qualifiers_from_header(header_text: str, doc_context: dict[st
     if consolidation_match:
         qualifiers["consolidation"] = consolidation_match.group(1).lower()
 
-    year_match = DATE_YEAR_RE.search(header_text)
-    fy_match = FY_LABEL_RE.search(str(doc_context.get("reporting_period", "")))
-    if year_match and fy_match:
-        year = int(year_match.group(0))
-        fy_end_year = 2000 + int(fy_match.group(1))
-        if year == fy_end_year:
-            qualifiers["period_label"] = str(doc_context["reporting_period"])
-        elif year == fy_end_year - 1:
-            qualifiers["period_label"] = f"FY{(fy_end_year - 1) % 100:02d}"
+    stripped_header = header_text.strip()
+    if BARE_FY_LABEL_RE.match(stripped_header):
+        # The header already IS the period label -- e.g. an investor
+        # deck's table column literally headed "FY24"/"FY23", no full
+        # calendar year anywhere to cross-reference. DATE_YEAR_RE below
+        # only matches a 4-digit year ("2024"), so this style would
+        # otherwise never resolve to a period at all (see the FY24
+        # revenue-corroboration case, docs/CASE_DOSSIER.md §1).
+        qualifiers["period_label"] = re.sub(r"\s+", "", stripped_header.upper())
+    else:
+        year_match = DATE_YEAR_RE.search(header_text)
+        fy_match = FY_LABEL_RE.search(str(doc_context.get("reporting_period", "")))
+        if year_match and fy_match:
+            year = int(year_match.group(0))
+            fy_end_year = 2000 + int(fy_match.group(1))
+            if year == fy_end_year:
+                qualifiers["period_label"] = str(doc_context["reporting_period"])
+            elif year == fy_end_year - 1:
+                qualifiers["period_label"] = f"FY{(fy_end_year - 1) % 100:02d}"
 
     return qualifiers
 
@@ -511,8 +559,9 @@ def _to_table_fact(
     model_used: str,
 ) -> Fact | None:
     """Builds a candidate Fact with provisional evidence offsets — NOT
-    grounding-verified yet, same contract as _to_fact. The caller runs it
-    through GroundingGate.verify() against the source block's text."""
+    grounding-verified yet, same contract as _to_fact, including the id
+    placeholder (see _to_fact's docstring). The caller runs it through
+    GroundingGate.verify() against the source block's text."""
     if not semantics.subject_surface_form.strip():
         logger.warning(
             "dropping table fact with no subject: %r (page %d block %d)",
@@ -535,7 +584,7 @@ def _to_table_fact(
         pass
 
     return Fact(
-        id=str(uuid.uuid4()),
+        id="",
         doc_id=doc_id,
         block_id=f"{doc_id}:p{record.page_no}:b{record.source_block_no}",
         subject=Entity(
@@ -582,6 +631,7 @@ def _extract_table_facts(
     rotator: KeyRotator,
     result: ExtractionResult,
     gate: GroundingGate,
+    on_batch: Callable[[list[Fact], list[QuarantineEntry]], None] | None = None,
 ) -> None:
     doc_id = doc_context.get("doc_id", "unknown")
     table_page_nos = sorted({b.page_no for b in blocks if b.page_type == "table"})
@@ -664,6 +714,8 @@ def _extract_table_facts(
                     continue
                 _save_table_cache(cache_key, response, model_used)
 
+            batch_facts: list[Fact] = []
+            quarantined_before = len(gate.quarantined)
             for semantics in response.facts:
                 if not (0 <= semantics.cell_index < len(batch)):
                     logger.warning("dropping table fact with out-of-range cell_index %d", semantics.cell_index)
@@ -677,9 +729,19 @@ def _extract_table_facts(
                     gate.quarantine(
                         fact, f"no source Block for page {record.page_no} block {record.source_block_no}"
                     )
+                    fact.id = _deterministic_fact_id(fact)
                     continue
-                if gate.verify(fact, source_block.text):
+                passed = gate.verify(fact, source_block.text)
+                fact.id = _deterministic_fact_id(fact)
+                if passed:
                     result.facts.append(fact)
+                    batch_facts.append(fact)
+            # Persist this batch's work immediately rather than waiting for
+            # the whole document to finish — a crash or interrupt on a
+            # later batch must not lose everything extracted so far (see
+            # extract_facts()'s on_batch for the same reasoning).
+            if on_batch is not None:
+                on_batch(batch_facts, gate.quarantined[quarantined_before:])
             batch_index += 1
 
 
@@ -688,6 +750,7 @@ def extract_facts(
     doc_context: dict[str, Any],
     pdf_path: str,
     rotator: KeyRotator | None = None,
+    on_batch: Callable[[list[Fact], list[QuarantineEntry]], None] | None = None,
 ) -> ExtractionResult:
     """Extract Facts from a document's prose and table Blocks. Slide blocks
     (page_type == "slide") are still skipped — not implemented yet.
@@ -710,6 +773,16 @@ def extract_facts(
     before it can reach result.facts (see grounding_gate.py): a fact whose
     evidence_quote doesn't fuzzy-match its source block is quarantined into
     result.quarantined with a reason, never silently dropped.
+
+    on_batch(new_facts, new_quarantined), if given, is called once per
+    completed batch (prose or table) with only the facts/quarantine entries
+    that batch just produced — NOT the running total. This is the hook
+    pipeline.py uses to persist to the repo incrementally: a document with
+    hundreds of batches must not lose everything extracted so far just
+    because a later batch crashes the process or gets interrupted. Whatever
+    on_batch already persisted stays persisted; only result.facts/
+    result.quarantined (the full in-memory totals, still returned as
+    normal) would be lost on a crash.
     """
     doc_id = doc_context.get("doc_id", "unknown")
     gate = GroundingGate()
@@ -801,18 +874,27 @@ def extract_facts(
                 continue
             _save_cache(cache_key, response, model_used)
 
+        batch_facts: list[Fact] = []
+        quarantined_before = len(gate.quarantined)
         for extracted in response.facts:
             if not (0 <= extracted.block_index < len(batch)):
                 logger.warning("dropping fact with out-of-range block_index %d", extracted.block_index)
                 continue
             block, heading = batch[extracted.block_index]
             fact = _to_fact(extracted, block, heading, doc_id, model_used)
-            if fact is not None and gate.verify(fact, block.text):
+            if fact is None:
+                continue
+            passed = gate.verify(fact, block.text)
+            fact.id = _deterministic_fact_id(fact)
+            if passed:
                 result.facts.append(fact)
+                batch_facts.append(fact)
+        if on_batch is not None:
+            on_batch(batch_facts, gate.quarantined[quarantined_before:])
         batch_index += 1
 
     if table_blocks:
-        _extract_table_facts(blocks, doc_context, pdf_path, rotator, result, gate)
+        _extract_table_facts(blocks, doc_context, pdf_path, rotator, result, gate, on_batch=on_batch)
 
     result.quarantined = gate.quarantined
     return result

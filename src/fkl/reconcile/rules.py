@@ -57,6 +57,7 @@ from dataclasses import replace as dc_replace
 from datetime import date
 
 from src.fkl.link.claim_key import claim_key_components, normalize_qualifier
+from src.fkl.normalize.measures import measures_aliased_not_identical
 from src.fkl.normalize.units import SCALE_MULTIPLIERS, NormalizedValue, normalize_value
 from src.fkl.store.models import (
     Delta,
@@ -175,6 +176,32 @@ def _effective_value(fact: Fact) -> NormalizedValue | None:
 
 
 def reconcile(fact_a: Fact, fact_b: Fact) -> Relation:
+    """Public entry point: decides the verdict via _reconcile_decide(), then
+    checks whether the pair was only linked through measure ALIASING
+    (normalize/measures.py's canonicalize_measure, consulted inside
+    claim_key_components — an alias match means "worth comparing," not
+    "the same measure"). A resulting CORROBORATES gets its reason_code
+    forced to SCALE_NORMALIZED plus a caveat recording which two surface
+    forms were linked and that their definitions may differ — see
+    docs/CASE_DOSSIER.md §1. CONTRADICTS/other verdicts on an aliased pair
+    are left as rules.py already decided them; only a CORROBORATES needs
+    the caveat, since that's the case that could otherwise be mistaken for
+    "these two measures mean the same thing"."""
+    relation = _reconcile_decide(fact_a, fact_b)
+    if relation.type == RelationType.CORROBORATES and measures_aliased_not_identical(
+        fact_a.measure.surface_form, fact_b.measure.surface_form
+    ):
+        caveat = (
+            f"Linked via measure aliasing ({fact_a.measure.surface_form!r} ~ "
+            f"{fact_b.measure.surface_form!r}) — not identical wording. The definitions "
+            f"may differ (e.g. one may exclude a component the other includes); this "
+            f"agreement is contingent, not guaranteed to hold in general."
+        )
+        return relation.model_copy(update={"reason_code": ReasonCode.SCALE_NORMALIZED, "caveat": caveat})
+    return relation
+
+
+def _reconcile_decide(fact_a: Fact, fact_b: Fact) -> Relation:
     comp_a = claim_key_components(fact_a)
     comp_b = claim_key_components(fact_b)
 
@@ -197,7 +224,15 @@ def reconcile(fact_a: Fact, fact_b: Fact) -> Relation:
             )
 
     # -- 3. consolidation --
-    if comp_a.consolidation != comp_b.consolidation:
+    # Only a CONFIRMED mismatch (both sides state a basis, and they
+    # differ) counts here — one side simply not stating a consolidation
+    # basis at all (common for an investor deck vs a statutory filing,
+    # e.g. docs/CASE_DOSSIER.md §1's Q4 deck, which never uses the word
+    # "consolidated") is silence, not evidence of disagreement. Treating
+    # it as a mismatch would block every deck-vs-filing comparison at this
+    # step before value comparison (and the caveated-CORROBORATES path for
+    # aliased measures, see reconcile()) ever gets a chance to run.
+    if comp_a.consolidation and comp_b.consolidation and comp_a.consolidation != comp_b.consolidation:
         return _relation(
             fact_a, fact_b, RelationType.RECONCILED_BY_CONTEXT, ReasonCode.SCOPE_MISMATCH,
             f"Consolidation differs: {comp_a.consolidation!r} vs {comp_b.consolidation!r} — "

@@ -149,7 +149,24 @@ class Relation(BaseModel):
     fact_b_id: str
     type: RelationType
     reason_code: ReasonCode
-    explanation: str
+    # type/reason_code are decided by reconcile/rules.py alone — no LLM
+    # involved. explanation is a SEPARATE, optional narration step on top
+    # of an already-complete verdict (reconcile/adjudicator.py's
+    # write_explanation/adjudicate): if that step can't run (provider
+    # unavailable, quota exhausted, any reason), the verdict is still
+    # persisted as-is, with explanation=None and explanation_pending=True
+    # flagging that only the prose is missing — never as a lost or
+    # withheld relation. See pipeline.py's _reconcile_pair.
+    explanation: str | None = None
+    explanation_pending: bool = False
+    # Set only when reconcile/rules.py linked this pair via measure
+    # ALIASING (normalize/measures.py), not literal identical wording — an
+    # alias match means "worth comparing," not "the same measure." A
+    # resulting CORROBORATES must carry this caveat rather than silently
+    # implying the definitions are identical (docs/CASE_DOSSIER.md §1:
+    # "Revenue from Operations" vs "Revenue for services" agree in FY24
+    # value only because traded-goods revenue was ~0 that year).
+    caveat: str | None = None
     delta: Delta | None = None
     confidence: float
     adjudicator: Adjudicator

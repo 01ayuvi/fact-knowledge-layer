@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from src.fkl.link.claim_key import claim_key, claim_key_components, loose_key
 from src.fkl.store.models import Confidence, Entity, Evidence, Fact, Measure, Provenance, Value
@@ -61,3 +61,25 @@ def test_components_expose_resolved_period():
     c = claim_key_components(a)
     assert c.subject_id == "delhivery_limited"
     assert c.period_start is not None and c.period_end is not None
+
+
+def test_date_qualifier_takes_precedence_over_period_label():
+    """Regression: a monthly table (e.g. ESOP-exercised-per-month) where
+    every row shares one period_label ("FY2023-24") but has its own `date`
+    qualifier used to collapse onto the SAME exact claim key -- 12 distinct
+    monthly figures diffed against each other as if they were repeated
+    measurements of one thing, producing false CONTRADICTS (105/107 in a
+    real Delhivery ingest, see docs/LIMITATIONS.md). date is strictly more
+    precise than a fiscal-year label and must win."""
+    april = make_fact("Delhivery Limited", "Employee Stock Options Exercised", "158,855", {"date": "2023-04-06", "period_label": "FY2023-24"})
+    june = make_fact("Delhivery Limited", "Employee Stock Options Exercised", "1,941,454", {"date": "2023-06-08", "period_label": "FY2023-24"})
+    assert claim_key(april) != claim_key(june)
+    assert loose_key(april) == loose_key(june)  # still found as candidates, just not exact-matched
+
+    c = claim_key_components(april)
+    assert c.period_start == c.period_end == date(2023, 4, 6)
+
+    # same date -> same claim key, even with no period_label at all
+    same_day_a = make_fact("Delhivery Limited", "Employee Stock Options Exercised", "1", {"date": "2023-04-06"})
+    same_day_b = make_fact("Delhivery Limited", "Employee Stock Options Exercised", "2", {"date": "2023-04-06"})
+    assert claim_key(same_day_a) == claim_key(same_day_b)

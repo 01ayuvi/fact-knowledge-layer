@@ -56,14 +56,33 @@ async def upload_document(file: UploadFile = File(...)) -> StreamingResponse:
     event_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
 
     def run_ingest() -> None:
-        repo = Repo(deps.DB_PATH)
-        try:
-            def on_progress(stage: str, data: dict[str, Any]) -> None:
-                event_queue.put({"stage": stage, **_json_safe(data)})
+        # ingest_document() already notifies an "error" stage itself before
+        # re-raising (see pipeline.py) — this flag stops that from also
+        # being duplicated by the except below, which previously pushed a
+        # second, identical error event for every ingest failure (a user
+        # watching the log would see "Error: ..." twice for one failure).
+        # The except stays as a fallback for anything that fails OUTSIDE
+        # ingest_document's own try/except, e.g. Repo(deps.DB_PATH) itself.
+        error_notified = False
 
-            ingest_document(str(dest), repo=repo, on_progress=on_progress)
+        def on_progress(stage: str, data: dict[str, Any]) -> None:
+            nonlocal error_notified
+            if stage == "error":
+                error_notified = True
+            event_queue.put({"stage": stage, **_json_safe(data)})
+
+        try:
+            repo = Repo(deps.DB_PATH)
         except Exception as exc:  # noqa: BLE001 — must reach the client as an SSE error event
             event_queue.put({"stage": "error", "message": str(exc)})
+            event_queue.put(None)
+            return
+
+        try:
+            ingest_document(str(dest), repo=repo, on_progress=on_progress)
+        except Exception as exc:  # noqa: BLE001 — must reach the client as an SSE error event
+            if not error_notified:
+                event_queue.put({"stage": "error", "message": str(exc)})
         finally:
             repo.close()
             event_queue.put(None)  # sentinel: stream complete

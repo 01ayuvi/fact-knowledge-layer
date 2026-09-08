@@ -179,3 +179,28 @@ def test_upload_document_streams_sse_and_persists(client, tmp_path):
 def test_upload_rejects_non_pdf(client):
     resp = client.post("/documents", files={"file": ("notes.txt", b"hello", "text/plain")})
     assert resp.status_code == 400
+
+
+def test_quota_exhaustion_surfaces_once_as_a_clear_message(client):
+    """Regression: ingest_document() already notifies an "error" stage
+    itself before re-raising -- the route's own except used to ALSO push a
+    second, identical error event for the same failure, so a user watching
+    the upload log would see "Error: ..." twice for one quota-exhaustion
+    event. Must appear exactly once, and as the exception's own clear
+    message -- not a stack trace."""
+    from src.fkl.extract.providers import AllKeysExhaustedError
+
+    with patch(
+        "src.fkl.pipeline.extract_blocks",
+        side_effect=AllKeysExhaustedError("all 5 API key(s) exhausted their daily quota"),
+    ):
+        resp = client.post(
+            "/documents",
+            files={"file": ("quota_test.pdf", b"%PDF-1.4 fake content", "application/pdf")},
+        )
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert body.count('"stage": "error"') == 1
+    assert "all 5 API key(s) exhausted their daily quota" in body
+    assert "Traceback" not in body

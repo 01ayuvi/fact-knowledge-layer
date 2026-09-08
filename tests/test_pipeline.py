@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from src.fkl.extract.extractor import ExtractionResult
+from src.fkl.extract.providers import AllKeysExhaustedError
 from src.fkl.pipeline import ingest_document
 from src.fkl.reconcile.adjudicator import ExplanationResponse
 from src.fkl.store.models import (
@@ -23,19 +24,28 @@ from src.fkl.store.models import (
     Fact,
     Measure,
     Provenance,
+    ReasonCode,
+    RelationType,
     Value,
 )
 from src.fkl.store.repo import Repo
 
 
-def make_fact(subject: str, measure: str, value_raw: str, qualifiers: dict | None = None, doc_id: str = "doc1") -> Fact:
+def make_fact(
+    subject: str,
+    measure: str,
+    value_raw: str,
+    qualifiers: dict | None = None,
+    doc_id: str = "doc1",
+    fact_type: str = "numeric",
+) -> Fact:
     return Fact(
         id=str(uuid.uuid4()),
         doc_id=doc_id,
         block_id=f"{doc_id}:p1:b0",
         subject=Entity(canonical_id="x", surface_form=subject),
         measure=Measure(canonical_id="m", surface_form=measure),
-        fact_type="numeric",
+        fact_type=fact_type,
         value=Value(raw=value_raw),
         qualifiers=qualifiers or {},
         evidence=Evidence(page_no=1, char_start=0, char_end=len(value_raw), bbox=[(0, 0, 1, 1)], quote=value_raw),
@@ -232,6 +242,82 @@ def test_explanation_writing_runs_concurrently_bounded_at_four(repo):
     assert elapsed < sequential_estimate * 0.6, (
         f"elapsed {elapsed:.2f}s not meaningfully faster than sequential {sequential_estimate:.2f}s"
     )
+
+
+def test_explanation_writing_failure_still_persists_the_verdict(repo):
+    """The core guarantee: type/reason_code come from reconcile()'s
+    deterministic rules alone, with no LLM involved -- so a pair hitting
+    AllKeysExhaustedError (e.g. every provider's daily quota exhausted
+    mid-run, as actually happened on a real Delhivery ingest) while writing
+    the EXPLANATION must not lose the verdict or abort the rest of
+    reconciliation. It persists with explanation=None and
+    explanation_pending=True, not as a RelationFailure -- a missing
+    narration is not a missing relation."""
+    facts = [
+        make_fact("Delhivery Limited", "Revenue from Operations", str(100 + i), {"period_label": f"FY2{i}"})
+        for i in range(3)
+    ]
+    extraction = ExtractionResult(facts=facts)
+
+    call_count = {"n": 0}
+
+    def flaky_generate(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise AllKeysExhaustedError("all keys exhausted (test)")
+        return (ExplanationResponse(explanation="x"), "test-model")
+
+    with (
+        patch("src.fkl.pipeline.extract_blocks", return_value=[]),
+        patch("src.fkl.pipeline.extract_facts", return_value=extraction),
+        patch("src.fkl.reconcile.adjudicator.generate", side_effect=flaky_generate),
+    ):
+        result = ingest_document("x.pdf", doc_context={"doc_id": "doc1"}, repo=repo)
+
+    n_pairs = 3 * 2 // 2  # C(3,2)
+    assert result.failed_relations == []
+    assert sum(result.relations_by_type.values()) == n_pairs
+
+    stored = repo.relations_by_doc("doc1")
+    assert len(stored) == n_pairs
+    pending = [r for r in stored if r.explanation_pending]
+    assert len(pending) == 1
+    assert pending[0].explanation is None
+    # the verdict itself is untouched by the narration failure
+    assert pending[0].type == RelationType.RECONCILED_BY_CONTEXT
+    assert pending[0].reason_code == ReasonCode.PERIOD_DISJOINT
+
+
+def test_adjudication_failure_still_persists_the_rule_verdict(repo):
+    """Same guarantee, the other branch: a non-numeric pair reconcile()
+    itself can't confidently classify further routes to
+    RECONCILED_BY_CONTEXT/UNRESOLVED for adjudicate() to refine -- if THAT
+    call fails too, the fallback is reconcile()'s own already-complete
+    UNRESOLVED verdict (adjudicator="rule"), not a lost pair."""
+    fact_a = make_fact("Delhivery Limited", "Strategic priority", "Expand express network", fact_type="assertion", doc_id="doc1")
+    fact_b = make_fact("Delhivery Limited", "Strategic priority", "Deepen part truckload reach", fact_type="assertion", doc_id="doc2")
+
+    with (
+        patch("src.fkl.pipeline.extract_blocks", return_value=[]),
+        patch("src.fkl.pipeline.extract_facts", return_value=ExtractionResult(facts=[fact_a])),
+    ):
+        ingest_document("a.pdf", doc_context={"doc_id": "doc1"}, repo=repo)
+
+    with (
+        patch("src.fkl.pipeline.extract_blocks", return_value=[]),
+        patch("src.fkl.pipeline.extract_facts", return_value=ExtractionResult(facts=[fact_b])),
+        patch("src.fkl.reconcile.adjudicator.generate", side_effect=AllKeysExhaustedError("all keys exhausted (test)")),
+    ):
+        result2 = ingest_document("b.pdf", doc_context={"doc_id": "doc2"}, repo=repo)
+
+    assert result2.failed_relations == []
+    stored = repo.relations_by_doc("doc2")
+    assert len(stored) == 1
+    assert stored[0].explanation_pending is True
+    assert stored[0].explanation is None
+    assert stored[0].type == RelationType.RECONCILED_BY_CONTEXT
+    assert stored[0].reason_code == ReasonCode.UNRESOLVED
+    assert stored[0].adjudicator == "rule"
 
 
 def test_on_progress_reports_expected_stages(repo):

@@ -29,7 +29,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
+import time
 from typing import TypeVar
 
 import httpx
@@ -202,21 +204,63 @@ class KeyRotator:
                 raise
 
 
-def _is_daily_quota_error_groq(exc: httpx.HTTPStatusError) -> bool:
-    """True for a 429 whose message names a per-DAY (RPD) limit rather than
-    a transient per-minute/per-second rate limit — mirrors
-    is_daily_quota_error's role for Gemini. Groq's rate-limit error text
-    looks like 'Rate limit reached for model `X` ... on requests per day
-    (RPD): Limit 14400, Used 14400, Requested 1. Please try again in
-    23h59m59s.' for a hard daily cap, vs '... requests per minute (RPM) ...'
-    or '... tokens per minute (TPM) ...' for the transient case that should
-    just back off on the same key instead of rotating."""
+# Matches ONLY an explicit per-day quota unit ("requests per day"/"tokens
+# per day", or Groq's (RPD)/(TPD) abbreviation for those) — deliberately
+# does not match a bare "per day" substring, and never matches per-minute/
+# per-second (RPM/TPM) phrasing, which must keep the same key and just
+# back off (see _is_retryable_groq). A live 429 on the real Groq API read:
+# 'Rate limit reached for model `openai/gpt-oss-120b` ... on tokens per
+# day (TPD): Limit 200000, Used 199387, Requested 1274. Please try again
+# in 4m45.552s.' — note the retry-after is minutes, not a full day: Groq's
+# "per day" limit is a rolling token/request budget that frees up
+# incrementally as old usage ages out of the window, NOT a hard reset once
+# every 24h the way Gemini's free-tier daily cap is. GroqKeyRotator must
+# NOT treat this the same as Gemini's KeyRotator (permanent-for-session
+# blacklist) — it cools the key down for the duration Groq itself reports,
+# not indefinitely (see _parse_retry_after_seconds).
+_DAILY_QUOTA_UNIT_RE = re.compile(r"\b(?:requests|tokens)\s+per\s+day\b|\((?:rpd|tpd)\)", re.IGNORECASE)
+# (?!s) on the minutes group excludes a bare "432ms" (milliseconds) from
+# being misread as "432m" (minutes) -- (\d+)m alone greedily swallows the
+# "m" in "ms", turning a sub-second cooldown into a 7+ hour one. A trailing
+# "432ms" is instead caught by the dedicated milliseconds group.
+_RETRY_AFTER_RE = re.compile(
+    r"try again in\s+(?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?(?:(\d+)ms)?", re.IGNORECASE
+)
+DEFAULT_DAILY_COOLDOWN_SECONDS = 60.0
+
+
+def _groq_error_message(exc: httpx.HTTPStatusError) -> str:
     try:
-        message = str(exc.response.json().get("error", {}).get("message", ""))
+        return str(exc.response.json().get("error", {}).get("message", ""))
     except Exception:
-        message = exc.response.text if exc.response is not None else ""
-    text = message.lower()
-    return "per day" in text or "(rpd)" in text
+        return exc.response.text if exc.response is not None else ""
+
+
+def _is_daily_quota_error_groq(exc: httpx.HTTPStatusError) -> bool:
+    """True only for a 429 whose message names an explicit per-day quota
+    unit — see _DAILY_QUOTA_UNIT_RE above for why the match is this
+    narrow."""
+    return bool(_DAILY_QUOTA_UNIT_RE.search(_groq_error_message(exc)))
+
+
+def _parse_retry_after_seconds(exc: httpx.HTTPStatusError) -> float:
+    """Groq's daily-quota message includes its own 'Please try again in
+    ...' hint (e.g. '4m45.552s', '23h59m59s') — use THAT as the cooldown
+    instead of guessing, since the window is rolling, not a fixed 24h
+    reset (see _DAILY_QUOTA_UNIT_RE). Falls back to
+    DEFAULT_DAILY_COOLDOWN_SECONDS only if the message doesn't parse."""
+    match = _RETRY_AFTER_RE.search(_groq_error_message(exc))
+    if not match:
+        return DEFAULT_DAILY_COOLDOWN_SECONDS
+    hours, minutes, seconds, millis = match.groups()
+    if not (hours or minutes or seconds or millis):
+        return DEFAULT_DAILY_COOLDOWN_SECONDS
+    return (
+        (int(hours or 0) * 3600)
+        + (int(minutes or 0) * 60)
+        + float(seconds or 0)
+        + (int(millis or 0) / 1000)
+    )
 
 
 def _is_retryable_groq(exc: BaseException) -> bool:
@@ -269,10 +313,17 @@ def _groq_chat_completion(prompt: str, api_key: str) -> str:
 class GroqKeyRotator:
     """Round-robins across GROQ_API_KEYS, mirroring KeyRotator's
     exhaustion-and-rotate logic (see its docstring) but adapted to Groq's
-    httpx-based errors via _is_daily_quota_error_groq. Groq is the primary
-    provider here (Gemini is only the fallback), so it burns through its
-    own rate-limit budget far faster in practice — rotation matters more
-    for Groq than it does for Gemini.
+    httpx-based errors via _is_daily_quota_error_groq — with one
+    deliberate difference: Groq's "per day" quota is a ROLLING window that
+    frees up within minutes (see _parse_retry_after_seconds), not a hard
+    once-per-24h reset like Gemini's free tier. So a key that hits it is
+    cooled down for the duration Groq itself reports, not permanently
+    blacklisted for the rest of the process the way KeyRotator treats a
+    Gemini daily-quota key — that would otherwise strand a perfectly good
+    key for hours over what's really just a few minutes of backpressure.
+    Groq is the primary provider here (Gemini is only the fallback), so it
+    burns through its own rate-limit budget far faster in practice —
+    rotation matters more for Groq than it does for Gemini.
 
     Safe to share across threads, same locking discipline as KeyRotator:
     _lock guards key-selection state only, released before the network
@@ -282,7 +333,7 @@ class GroqKeyRotator:
         if not api_keys:
             raise ValueError("GroqKeyRotator requires at least one API key")
         self._api_keys = api_keys
-        self._exhausted: set[int] = set()
+        self._exhausted_until: dict[int, float] = {}  # key index -> epoch seconds
         self._current = 0
         self._lock = threading.RLock()
 
@@ -310,12 +361,17 @@ class GroqKeyRotator:
         with self._lock:
             return self._current
 
+    def _is_cooling_down(self, index: int) -> bool:
+        # caller already holds _lock
+        resume_at = self._exhausted_until.get(index)
+        return resume_at is not None and time.time() < resume_at
+
     def _advance(self) -> None:
         # caller already holds _lock
         total = len(self._api_keys)
         for offset in range(1, total + 1):
             candidate = (self._current + offset) % total
-            if candidate not in self._exhausted:
+            if not self._is_cooling_down(candidate):
                 self._current = candidate
                 return
 
@@ -323,9 +379,9 @@ class GroqKeyRotator:
         total = len(self._api_keys)
         while True:
             with self._lock:
-                if len(self._exhausted) >= total:
-                    raise AllKeysExhaustedError(f"all {total} Groq API key(s) exhausted their daily quota")
-                if self._current in self._exhausted:
+                if all(self._is_cooling_down(i) for i in range(total)):
+                    raise AllKeysExhaustedError(f"all {total} Groq API key(s) are cooling down on their daily quota")
+                if self._is_cooling_down(self._current):
                     self._advance()
                     continue
                 current_index = self._current
@@ -335,13 +391,14 @@ class GroqKeyRotator:
                 return _groq_chat_completion(prompt, api_key)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 429 and _is_daily_quota_error_groq(exc):
+                    cooldown = _parse_retry_after_seconds(exc)
                     with self._lock:
-                        self._exhausted.add(current_index)
+                        self._exhausted_until[current_index] = time.time() + cooldown
                         logger.warning(
-                            "Groq key index %d exhausted its daily quota (%d/%d keys exhausted so far)",
+                            "Groq key index %d hit its per-day quota, cooling down for %.0fs (%s)",
                             current_index,
-                            len(self._exhausted),
-                            total,
+                            cooldown,
+                            _groq_error_message(exc),
                         )
                         self._advance()
                     continue
