@@ -62,7 +62,7 @@ Run the test suite:
 pytest
 ```
 
-**Current test status:** TODO tests passing.
+**Current test status:** 116 tests passing.
 
 ---
 
@@ -239,7 +239,7 @@ First, PyMuPDF fragmented table rows into separate line entries when cells were 
 
 Second, Groq was found to truncate a response mid-JSON when `max_completion_tokens` was not configured. The truncated JSON was then rejected as a non-retryable 400, producing a zero-fact batch without the underlying failure being surfaced clearly. This resulted in explicit completion-token limits, bounded batches, retries, caching, and provider fallback.
 
-The current automated test count is **TODO**.
+The current automated test count is **116**.
 
 ---
 
@@ -311,7 +311,8 @@ Extraction is cached by content hash and prompt version, so re-ingesting a proce
 
 Batches are bounded by both character count and block count, following oversized payloads that returned HTTP 413 from the provider. Facts persist per batch rather than per document, so a run that fails partway does not lose completed work. Explanation-writing is parallelized across a bounded thread pool.
 
-**Delhivery corpus ingest:** TODO wall-clock, facts, quarantined, relations.
+
+**Delhivery corpus ingest:** 577 facts, 3 quarantined, 271 relations across three documents.
 
 ### Many PDFs in one knowledge layer
 
