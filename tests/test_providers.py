@@ -4,8 +4,9 @@ calls, no API keys needed."""
 from __future__ import annotations
 
 import httpx
+import pytest
 
-from src.fkl.extract.providers import _is_daily_quota_error_groq, _parse_retry_after_seconds
+from src.fkl.extract.providers import KeyRotator, _is_daily_quota_error_groq, _parse_retry_after_seconds
 
 
 def make_429(message: str) -> httpx.HTTPStatusError:
@@ -46,3 +47,25 @@ def test_daily_quota_signal_requires_explicit_unit():
     assert _is_daily_quota_error_groq(make_429("... on tokens per day (TPD): ...")) is True
     assert _is_daily_quota_error_groq(make_429("... on requests per minute (RPM): ...")) is False
     assert _is_daily_quota_error_groq(make_429("... on tokens per minute (TPM): ...")) is False
+
+
+def test_gemini_rotator_with_zero_keys_constructs_without_raising():
+    """Groq is the primary provider (README: 'Either provider alone is
+    sufficient') -- a Groq-only .env must be able to construct the Gemini
+    fallback rotator (built eagerly at the start of extract_facts()/
+    ingest_document(), before it's known whether Gemini will ever actually
+    be needed) without being forced to configure a provider it may never
+    call."""
+    rotator = KeyRotator([])
+    assert len(rotator) == 0
+
+
+def test_gemini_rotator_error_only_at_actual_use_names_groq_first():
+    """The error belongs at the point Gemini is actually needed (Groq
+    already failed), not at construction -- and once there, it should
+    name Groq as the primary provider first, Gemini as the fallback."""
+    rotator = KeyRotator([])
+    with pytest.raises(RuntimeError) as exc_info:
+        rotator.generate("prompt", object)
+    message = str(exc_info.value)
+    assert message.index("GROQ_API_KEYS") < message.index("GOOGLE_API_KEYS")

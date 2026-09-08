@@ -15,7 +15,11 @@ wait (since a daily cap won't clear by waiting); a 429 that's a per-minute
 rate limit, or a 5xx, keeps the same key and backs off exponentially.
 - Gemini: reads GOOGLE_API_KEYS (comma-separated) from .env, falling back
   to a single GOOGLE_API_KEY for backward compatibility (see KeyRotator,
-  is_retryable, is_daily_quota_error).
+  is_retryable, is_daily_quota_error). Optional — a Groq-only .env
+  constructs a zero-key KeyRotator without error; the "no Gemini key
+  configured" error only surfaces from generate() at the point Gemini is
+  actually needed (Groq already failed), and names GROQ_API_KEYS first
+  since Groq is primary.
 - Groq: reads GROQ_API_KEYS (comma-separated) from .env, falling back to a
   single GROQ_API_KEY for backward compatibility (see GroqKeyRotator,
   _is_retryable_groq, _is_daily_quota_error_groq). Groq is the primary
@@ -128,8 +132,13 @@ class KeyRotator:
     serialize on each other — only the brief key-selection step does."""
 
     def __init__(self, api_keys: list[str]):
-        if not api_keys:
-            raise ValueError("KeyRotator requires at least one API key")
+        # Zero keys is allowed here on purpose (unlike GroqKeyRotator,
+        # which requires at least one) — Gemini is only ever the FALLBACK
+        # provider, so a Groq-only setup ("Either provider alone is
+        # sufficient" per the README) must not be forced to configure a
+        # provider it never actually calls. generate() raises the real,
+        # accurate error at the point Gemini is actually needed, not here
+        # at construction time — see generate()'s empty-key check below.
         self._api_keys = api_keys
         self._clients: dict[int, genai.Client] = {}
         self._exhausted: set[int] = set()
@@ -144,11 +153,12 @@ class KeyRotator:
         if not keys:
             single = os.environ.get("GOOGLE_API_KEY", "").strip()
             keys = [single] if single else []
-        if not keys:
-            raise RuntimeError(
-                "no API key found: set GOOGLE_API_KEYS (comma-separated) or "
-                "GOOGLE_API_KEY in .env"
-            )
+        # No raise here even if keys is empty -- see __init__'s docstring.
+        # A Groq-only .env must be able to construct this rotator (it's
+        # built eagerly at the start of extract_facts()/ingest_document(),
+        # long before it's known whether Gemini will ever actually be
+        # needed) without being told to configure a provider it may never
+        # call.
         return cls(keys)
 
     def __len__(self) -> int:
@@ -175,6 +185,18 @@ class KeyRotator:
 
     def generate(self, prompt: str, response_model: type[_ResponseT]) -> _ResponseT:
         total = len(self._api_keys)
+        if total == 0:
+            # Only raised here, at the point Gemini is actually needed
+            # (Groq already failed/exhausted and this fallback was
+            # reached) -- not eagerly at construction, so a Groq-only
+            # setup that never needs Gemini never sees this at all. Groq
+            # is the primary provider and named first for that reason.
+            raise RuntimeError(
+                "Groq failed and there's no Gemini fallback available: set GROQ_API_KEYS "
+                "(comma-separated, primary provider) in .env, and/or GOOGLE_API_KEYS "
+                "(comma-separated, Gemini fallback) or GOOGLE_API_KEY if you want Gemini "
+                "available as a fallback too."
+            )
         while True:
             with self._lock:
                 if len(self._exhausted) >= total:
