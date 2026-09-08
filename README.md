@@ -249,10 +249,10 @@ Full evidence, source quotes, and reasoning traces are documented in [`docs/FOUR
 
 | # | Case | Verdict / reason code | Evidence |
 |---|------|----------------------|----------|
-| 1 | Corroborated across documents, expressed differently | TODO | TODO |
-| 2 | Genuine or likely contradiction | TODO | TODO |
-| 3 | Apparent contradiction explained by context | TODO | TODO |
-| 4 | Extraction or reasoning failure found and handled | — | See Limitations |
+| 1 | Corroborated across documents, expressed differently | `CORROBORATES` / `SCALE_NORMALIZED` (caveated — linked via measure aliasing) | Annual Report FY24 p22 `"81,415.38"` vs Q4 deck p17 `"8,142"` — 0.006% apart |
+| 2 | Genuine or likely contradiction | `CONTRADICTS` / `VALUES_DIVERGE` | Annual Report FY24 p24: board meeting `"August 04, 2023"` vs `"August 24, 2023"` |
+| 3 | Apparent contradiction explained by context | `RECONCILED_BY_CONTEXT` / `SCOPE_MISMATCH` | Annual Report FY24 p22, same measure/period: Standalone `"74,540.82"` vs Consolidated `"81,415.38"` |
+| 4 | Extraction or reasoning failure found and handled | Claim-key over-collapse: `CONTRADICTS` count dropped 107 → 2 | See [`docs/FOUR_CASES.md`](docs/FOUR_CASES.md) §4 |
 
 The demo shows the first three with their source evidence and the system's reasoning. The fourth demonstrates a failure discovered during real execution and the corresponding mitigation.
 
