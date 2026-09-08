@@ -42,6 +42,20 @@ python -m uvicorn apps.api.main:app --reload
 
 Open <http://127.0.0.1:8000>. Upload a PDF and watch it ingest live; progress streams over SSE. Extracted facts, reconciled relations, and the grounding review queue are available through the UI tabs. The interactive API reference is at <http://127.0.0.1:8000/docs>.
 
+### Offline demo mode
+
+`data/store.db` is committed to this repo, already seeded with the full Delhivery corpus (facts, quarantined entries, and reconciled relations — including the FY24 revenue corroboration described in [The Four Required Cases](#the-four-required-cases)). **No API key is required to see a populated, working system** — cloning the repo and starting the server is enough. An API key is only needed to ingest a *new* PDF.
+
+One-command setup (creates/reuses `.venv`, installs requirements, starts the server):
+
+```bash
+./scripts/demo.sh          # macOS / Linux
+```
+
+```powershell
+.\scripts\demo.ps1         # Windows
+```
+
 Run the test suite:
 
 ```bash
