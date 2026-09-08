@@ -4,7 +4,8 @@ Extracts numerical and semantic facts from PDFs, grounds every fact to verified 
 
 > Superjoin VIT 2026 · Engineering Intern Assignment
 
-[**Demo video**](TODO)
+[**Demo video**]
+(https://drive.google.com/file/d/10dtxX7kVaguw8RtJNrwitj83-nNk53e0/view?usp=sharing)
 
 ![Fact evidence highlighted on its source page](docs/screenshot-fact-evidence.png)
 
@@ -62,13 +63,13 @@ Run the test suite:
 pytest
 ```
 
-**Current test status:** 116 tests passing.
+**Current test status:** 118 tests passing.
 
 ---
 
 ## Video Demo
 
-**Demo:** TODO
+**Demo:** https://drive.google.com/file/d/10dtxX7kVaguw8RtJNrwitj83-nNk53e0/view?usp=sharing
 
 The demo is under three minutes and shows:
 
@@ -239,7 +240,7 @@ First, PyMuPDF fragmented table rows into separate line entries when cells were 
 
 Second, Groq was found to truncate a response mid-JSON when `max_completion_tokens` was not configured. The truncated JSON was then rejected as a non-retryable 400, producing a zero-fact batch without the underlying failure being surfaced clearly. This resulted in explicit completion-token limits, bounded batches, retries, caching, and provider fallback.
 
-The current automated test count is **116**.
+The current automated test count is **118**.
 
 ---
 
@@ -249,10 +250,12 @@ Full evidence, source quotes, and reasoning traces are documented in [`docs/FOUR
 
 | # | Case | Verdict / reason code | Evidence |
 |---|------|----------------------|----------|
-| 1 | Corroborated across documents, expressed differently | `CORROBORATES` / `SCALE_NORMALIZED` (caveated — linked via measure aliasing) | Annual Report FY24 p22 `"81,415.38"` vs Q4 deck p17 `"8,142"` — 0.006% apart |
-| 2 | Genuine or likely contradiction | `CONTRADICTS` / `VALUES_DIVERGE` | Annual Report FY24 p24: board meeting `"August 04, 2023"` vs `"August 24, 2023"` |
-| 3 | Apparent contradiction explained by context | `RECONCILED_BY_CONTEXT` / `SCOPE_MISMATCH` | Annual Report FY24 p22, same measure/period: Standalone `"74,540.82"` vs Consolidated `"81,415.38"` |
+| 1 | Corroborated across documents, expressed differently | `CORROBORATES` / `SCALE_NORMALIZED` (caveated — linked via measure aliasing) | Annual Report FY24 p22 `"81,415.38"` (₹ million, consolidated) vs Q4 deck p17 `"8,142"` (₹ crore) — 0.006% apart after scale normalization |
+| 2 | Genuine or likely contradiction | `CONTRADICTS` / `VALUES_DIVERGE` — **see caveat below** | Annual Report FY24 p24: board meeting `"August 04, 2023"` vs `"August 24, 2023"` |
+| 3 | Apparent contradiction explained by context | `RECONCILED_BY_CONTEXT` / `SCOPE_MISMATCH` | Annual Report FY24 p22, same measure and period: Standalone `"74,540.82"` vs Consolidated `"81,415.38"` |
 | 4 | Extraction or reasoning failure found and handled | Claim-key over-collapse: `CONTRADICTS` count dropped 107 → 2 | See [`docs/FOUR_CASES.md`](docs/FOUR_CASES.md) §4 |
+
+**Caveat on Case 2, stated upfront rather than left to be discovered.** The two board-meeting dates share a single source block with no distinguishing qualifier, so these are almost certainly two separate meetings rather than a genuine conflict. The reconciler is behaving correctly given what it was told — the gap is upstream, in the same claim-key over-collapse pattern that Case 4 diagnoses and fixes, but without a `date` qualifier present for the fix to catch. A stronger contradiction case exists in the corpus (a director listed as active in the 2022 prospectus and as resigned in the FY24 annual report), but it cannot currently surface as a relation because of the unreachable-`SUPERSEDES` limitation documented below. Both are disclosed rather than papered over.
 
 The demo shows the first three with their source evidence and the system's reasoning. The fourth demonstrates a failure discovered during real execution and the corresponding mitigation.
 
@@ -274,11 +277,11 @@ Every observed limitation below was found by running the system against the corp
 
 **Value duplication on qualitative assertions.** 41 of 249 facts extracted from the Delhivery annual report have `measure_surface_form` identical to `value_raw`, predominantly `categorical` and `assertion` facts drawn from narrative prose where there is no discrete value separate from the claim itself. Numeric facts are largely unaffected. The extraction schema currently requires both fields, so the model duplicates the sentence into each. The cleaner solution is to make `value_raw` optional for non-numeric fact types, but that change would require re-extraction and was deferred.
 
-**Unreachable relation type: `SUPERSEDES`/`TEMPORAL_STATE_CHANGE`.** Implemented, tested, and unreachable in practice. Extraction never populates `Fact.validity_interval`, so it defaults to `(None, None)`, which the overlap check reads as fully overlapping — the supersession branch can never fire on real data. The rules unit test passes because it constructs validity intervals by hand, which nothing upstream does. Found by attempting the dossier's director state-change case end-to-end (2022 prospectus vs. FY24 annual report resignation note) rather than trusting the unit test — the pair reconciled as `UNRESOLVED`, not `SUPERSEDES`. The fix is to derive validity intervals from qualifiers during extraction, which was not attempted under time constraints. See `docs/LIMITATIONS.md` for the full write-up.
+**Unreachable relation type: `SUPERSEDES`/`TEMPORAL_STATE_CHANGE`.** Implemented, tested, and unreachable in practice. Extraction never populates `Fact.validity_interval`, so it defaults to `(None, None)`, which the overlap check reads as fully overlapping — the supersession branch can never fire on real data. The rules unit test passes because it constructs validity intervals by hand, which nothing upstream does. Found by attempting the director state-change case end-to-end (2022 prospectus vs. FY24 annual report resignation note) rather than trusting the unit test — the pair reconciled as `UNRESOLVED`, not `SUPERSEDES`. The fix is to derive validity intervals from qualifiers during extraction, which was not attempted under time constraints. See `docs/LIMITATIONS.md` for the full write-up.
 
 **Provider failures.** Groq was found to truncate output mid-JSON when `max_completion_tokens` was not configured; the malformed response was then rejected as a non-retryable 400 and produced a zero-fact batch without surfacing the underlying failure. Large batches also produced HTTP 413 payload errors. These findings led to bounded batches, explicit completion limits, retry handling, caching, and provider fallback. The pipeline now continues through total provider failure, logging failed batches rather than losing the documents already processed.
 
-**Free-tier quota bounds throughput.** A 100-page document needs roughly 200 LLM calls. Both Groq and Gemini free tiers were exhausted during final testing. Extraction is content-hash cached and the repository ships a seeded `data/store.db`, so the system can be explored end-to-end without any API key — see [Offline demo mode](#offline-demo-mode).
+**Free-tier quota bounds throughput, not the pipeline.** A 100-page document requires roughly 200 LLM calls. Both Groq and Gemini free tiers were exhausted during final testing, which is precisely why the committed `store.db` and the content-hash cache exist: a reviewer can explore the entire knowledge layer, including every relation and its evidence, without an API key and without waiting on a provider. Ingesting a genuinely new document does require live quota.
 
 **Incremental-ingest recovery.** Incremental skipping is currently keyed on document presence rather than successful completion, so a partially failed ingest may need to be cleared manually before it can be retried.
 
@@ -298,10 +301,11 @@ These have not yet appeared in the starter corpus but follow from the current de
 
 ### Next steps
 
-1. **Vision-assisted slide extraction** — recover visual bindings between chart labels, values, legends, and axes.
-2. **Same-page footnote resolution** — associate footnote markers and explanatory text with the facts they qualify.
-3. **Embedding-backed measure canonicalization** — improve candidate-linking recall when equivalent measures use terminology that deterministic normalization does not recognize.
-4. **Batched explanation generation** — generate explanations for multiple already-decided relationships in fewer LLM calls, reducing rate-limit overhead and latency.
+1. **Derive validity intervals during extraction** — this alone makes `SUPERSEDES` reachable and unlocks the director state-change case as a proper cross-document relation.
+2. **Vision-assisted slide extraction** — recover visual bindings between chart labels, values, legends, and axes.
+3. **Same-page footnote resolution** — associate footnote markers and explanatory text with the facts they qualify.
+4. **Embedding-backed measure canonicalization** — improve candidate-linking recall when equivalent measures use terminology that deterministic normalization does not recognize.
+5. **Batched explanation generation** — generate explanations for multiple already-decided relationships in fewer LLM calls, reducing rate-limit overhead and latency.
 
 ---
 
@@ -313,8 +317,7 @@ Extraction is cached by content hash and prompt version, so re-ingesting a proce
 
 Batches are bounded by both character count and block count, following oversized payloads that returned HTTP 413 from the provider. Facts persist per batch rather than per document, so a run that fails partway does not lose completed work. Explanation-writing is parallelized across a bounded thread pool.
 
-
-**Delhivery corpus ingest:** 577 facts, 3 quarantined, 271 relations across three documents.
+**Corpus ingest:** 680 facts, 35 quarantined, 1,446 relations across 4 documents (prospectus 5, annual report 454, Q4 deck 118, demo extract 103). Relations by type: 1,386 RECONCILED_BY_CONTEXT, 48 CORROBORATES, 11 CONTRADICTS, 1 REFINES.
 
 ### Many PDFs in one knowledge layer
 
